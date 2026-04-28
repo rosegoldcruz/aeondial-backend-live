@@ -3,6 +3,8 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import jwt from '@fastify/jwt';
 import fastifyStatic from '@fastify/static';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 import { authRoutes } from './routes/auth.js';
 import { sessionRoutes } from './routes/session.js';
 import { callRoutes } from './routes/calls.js';
@@ -12,6 +14,8 @@ import { leadRoutes } from './routes/leads.js';
 import { listRoutes } from './routes/lists.js';
 import { campaignStatsRoute } from './routes/campaignStats.js';
 import { telnyxWebhookRoutes } from './routes/webhooks.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const app = Fastify({ logger: true, bodyLimit: 52428800 });
 
@@ -60,6 +64,11 @@ await app.register(fastifyStatic, {
   root: '/var/www/aeondial',
   prefix: '/static/',
   decorateReply: false,
+});
+
+await app.register(fastifyStatic, {
+  root: join(__dirname, '../public/audio'),
+  prefix: '/audio/',
 });
 
 // ── Auth decorator ────────────────────────────────────────

@@ -30,5 +30,20 @@ module.exports = {
         NODE_ENV: 'production',
       }
     },
+    {
+      name: 'aeondial-healer',
+      script: 'dist/workers/healer.js',
+      cwd: '/var/www/aeondial/backend',
+      env_file: '/var/www/aeondial/backend/.env',
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '256M',
+      error_file: '/var/log/aeondial/healer-error.log',
+      out_file: '/var/log/aeondial/healer-out.log',
+      env: {
+        NODE_ENV: 'production',
+      }
+    },
   ],
 };
