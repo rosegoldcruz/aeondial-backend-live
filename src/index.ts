@@ -50,6 +50,7 @@ await app.register(cors, {
 const helmetPlugin = await import('@fastify/helmet');
 await app.register(helmetPlugin.default, {
   contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
 });
 
 const rateLimitPlugin = await import('@fastify/rate-limit');
