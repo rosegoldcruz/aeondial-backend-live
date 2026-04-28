@@ -5,7 +5,8 @@ import { supabase } from '../lib/supabase.js';
 import { redis } from '../lib/redis.js';
 import { checkAndPauseCampaignIfNeeded } from '../lib/abandonmentMonitor.js';
 import Telnyx from 'telnyx';
-const telnyx = new Telnyx({ apiKey: process.env.TELNYX_API_KEY });
+const telnyxApiKey = (process.env.TELNYX_API_KEY ?? '').trim();
+const telnyx = new Telnyx({ apiKey: telnyxApiKey });
 const DIAL_QUEUE = 'dial-queue';
 // ── TCPA: area code → IANA timezone ─────────────────────
 const AREA_CODE_TZ = {

@@ -6,7 +6,8 @@ import { redis } from '../lib/redis.js';
 import { checkAndPauseCampaignIfNeeded } from '../lib/abandonmentMonitor.js';
 import Telnyx from 'telnyx';
 
-const telnyx = new (Telnyx as any)({ apiKey: process.env.TELNYX_API_KEY });
+const telnyxApiKey = (process.env.TELNYX_API_KEY ?? '').trim();
+const telnyx = new (Telnyx as any)({ apiKey: telnyxApiKey });
 
 const DIAL_QUEUE = 'dial-queue';
 
