@@ -5,6 +5,7 @@ import jwt from '@fastify/jwt';
 import fastifyStatic from '@fastify/static';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { createReadStream, existsSync } from 'fs';
 import { authRoutes } from './routes/auth.js';
 import { sessionRoutes } from './routes/session.js';
 import { callRoutes } from './routes/calls.js';
@@ -66,9 +67,12 @@ await app.register(fastifyStatic, {
   decorateReply: false,
 });
 
-await app.register(fastifyStatic, {
-  root: join(__dirname, '../public/audio'),
-  prefix: '/audio/',
+await app.register(async (audioScope) => {
+  await audioScope.register(fastifyStatic, {
+    root: join(__dirname, '../public/audio'),
+    prefix: '/audio/',
+    decorateReply: false,
+  });
 });
 
 // ── Auth decorator ────────────────────────────────────────
@@ -90,6 +94,22 @@ await app.register(agentRoutes,         { prefix: '/agents' });
 await app.register(leadRoutes,          { prefix: '/leads' });
 await app.register(listRoutes,          { prefix: '/lists' });
 await app.register(telnyxWebhookRoutes);
+
+const ALLOWED_AUDIO_FILES = new Set(['HoldMusic.mp3', 'LiveAnswerIVR.mp3', 'VoicemailDrop.mp3']);
+app.get('/audio/:file', async (req: any, reply) => {
+  const file = String(req.params?.file ?? '');
+  if (!ALLOWED_AUDIO_FILES.has(file)) {
+    return reply.status(404).send({ error: 'Not Found' });
+  }
+
+  const fullPath = join(__dirname, '../public/audio', file);
+  if (!existsSync(fullPath)) {
+    return reply.status(404).send({ error: 'Not Found' });
+  }
+
+  reply.type('audio/mpeg');
+  return reply.send(createReadStream(fullPath));
+});
 
 // ── Health ────────────────────────────────────────────────
 app.get('/health', async () => ({ status: 'ok', ts: new Date().toISOString() }));
