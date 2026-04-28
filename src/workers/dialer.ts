@@ -473,7 +473,7 @@ async function rollback(agentId: string, leadIds: string[]) {
 async function failReservedLeads(agentId: string, leadIds: string[]) {
   await supabase
     .from('agent_sessions')
-    .update({ state: 'REGISTERED', active_call_id: null, updated_at: new Date().toISOString() })
+    .update({ state: 'READY', active_call_id: null, updated_at: new Date().toISOString() })
     .eq('agent_id', agentId);
 
   await supabase
