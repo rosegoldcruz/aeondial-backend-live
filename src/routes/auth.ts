@@ -14,7 +14,20 @@ const loginSchema = z.object({
 
 export async function authRoutes(app: FastifyInstance) {
   // POST /login
-  app.post('/login', async (req, reply) => {
+  app.post('/login', {
+    config: {
+      rateLimit: {
+        max: 10,
+        timeWindow: 60 * 1000,
+        ban: 5,
+        errorResponseBuilder: () => ({
+          statusCode: 429,
+          error: 'Too Many Requests',
+          message: 'Too many login attempts. Try again later.',
+        }),
+      },
+    },
+  } as any, async (req, reply) => {
     const body = loginSchema.safeParse(req.body);
     if (!body.success) {
       return reply.status(400).send({ error: 'Invalid request', details: body.error.flatten() });

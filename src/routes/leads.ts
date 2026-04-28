@@ -122,7 +122,15 @@ export async function leadRoutes(app: FastifyInstance) {
     return reply.send({ leads: data ?? [], total: count ?? data?.length ?? 0 });
   });
 
-  app.post('/import', { onRequest: [app.authenticate] } as any, async (req: any, reply) => {
+  app.post('/import', {
+    onRequest: [app.authenticate],
+    config: {
+      rateLimit: {
+        max: 5,
+        timeWindow: 60 * 1000,
+      },
+    },
+  } as any, async (req: any, reply) => {
     const csvText = typeof req.body === 'string' ? req.body : '';
     if (!csvText.trim()) return reply.status(400).send({ error: 'No CSV body' });
 

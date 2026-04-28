@@ -108,7 +108,15 @@ export async function leadRoutes(app) {
             return reply.status(500).send({ error: error.message });
         return reply.send({ leads: data ?? [], total: count ?? data?.length ?? 0 });
     });
-    app.post('/import', { onRequest: [app.authenticate] }, async (req, reply) => {
+    app.post('/import', {
+        onRequest: [app.authenticate],
+        config: {
+            rateLimit: {
+                max: 5,
+                timeWindow: 60 * 1000,
+            },
+        },
+    }, async (req, reply) => {
         const csvText = typeof req.body === 'string' ? req.body : '';
         if (!csvText.trim())
             return reply.status(400).send({ error: 'No CSV body' });

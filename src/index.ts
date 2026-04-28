@@ -15,18 +15,45 @@ import { telnyxWebhookRoutes } from './routes/webhooks.js';
 
 const app = Fastify({ logger: true, bodyLimit: 52428800 });
 
+if (!process.env.JWT_SECRET) {
+  throw new Error('FATAL: JWT_SECRET environment variable is not set');
+}
+
+const ALLOWED_ORIGINS = [
+  'https://ivsol.aeondial.com',
+  'https://crm.aeondial.com',
+  'http://localhost:3000',
+  'http://localhost:3001',
+];
+
 app.addContentTypeParser('text/csv', { parseAs: 'string' }, (_req, body, done) => {
   done(null, body);
 });
 
 // ── Plugins ──────────────────────────────────────────────
 await app.register(cors, {
-  origin: (_origin, cb) => cb(null, true),
+  origin: (origin, cb) => {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`CORS: origin ${origin} not allowed`), false);
+    }
+  },
   credentials: true,
 });
 
+const helmetPlugin = await import('@fastify/helmet');
+await app.register(helmetPlugin.default, {
+  contentSecurityPolicy: false,
+});
+
+const rateLimitPlugin = await import('@fastify/rate-limit');
+await app.register(rateLimitPlugin.default, {
+  global: false,
+});
+
 await app.register(jwt, {
-  secret: process.env.JWT_SECRET ?? 'changeme',
+  secret: process.env.JWT_SECRET,
 });
 
 await app.register(fastifyStatic, {

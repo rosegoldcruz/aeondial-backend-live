@@ -773,6 +773,15 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
     return reply.status(200).send({ ok: true })
   }
 
-  app.post('/telnyx', handleTelnyxWebhook)
-  app.post('/webhooks/telnyx', handleTelnyxWebhook)
+  const telnyxRateLimitConfig = {
+    config: {
+      rateLimit: {
+        max: 500,
+        timeWindow: 10 * 1000,
+      },
+    },
+  } as any
+
+  app.post('/telnyx', telnyxRateLimitConfig, handleTelnyxWebhook)
+  app.post('/webhooks/telnyx', telnyxRateLimitConfig, handleTelnyxWebhook)
 }
