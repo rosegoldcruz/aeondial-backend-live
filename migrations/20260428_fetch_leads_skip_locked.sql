@@ -4,7 +4,7 @@ CREATE OR REPLACE FUNCTION fetch_leads_skip_locked(
   p_max_attempts INT,
   p_batch_size INT
 ) RETURNS TABLE (
-  lead_id UUID,
+  id UUID,
   phone TEXT,
   first_name TEXT,
   last_name TEXT,

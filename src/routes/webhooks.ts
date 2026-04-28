@@ -1,5 +1,12 @@
 import type { FastifyInstance } from 'fastify'
 import { supabase } from '../lib/supabase.js'
+import { redis } from '../lib/redis.js'
+
+const POST_RELEASE_COOLDOWN_MS = 2000
+
+async function setAgentCooldown(agentId: string, ms = POST_RELEASE_COOLDOWN_MS) {
+  await redis.set(`dialer:agent:${agentId}:locked`, '1', 'PX', ms)
+}
 
 const TELNYX_API = 'https://api.telnyx.com/v2'
 const VOICEMAIL_DROP_URL = 'https://api.aeondial.com/static/VoicemailDrop.mp3'
@@ -322,31 +329,44 @@ async function saveInboundRecording(callData: any, clientState: ClientState) {
 }
 
 async function maybeReleaseBatchAgent(supabaseClient: any, groupId: string, agentId: string) {
-  const activeStatuses = [
-    'created',
-    'agent_dialing',
-    'agent_answered',
-    'lead_dialing',
-    'lead_answered',
-    'bridged',
-  ]
+  try {
+    const activeStatuses = [
+      'created',
+      'agent_dialing',
+      'agent_answered',
+      'lead_dialing',
+      'lead_answered',
+      'bridged',
+    ]
 
-  const { data: siblingCalls } = await supabaseClient
-    .from('calls')
-    .select('id, status')
-    .eq('group_id', groupId)
-    .in('status', activeStatuses)
+    const { data: siblingCalls } = await supabaseClient
+      .from('calls')
+      .select('id, status')
+      .eq('group_id', groupId)
+      .in('status', activeStatuses)
 
-  if (siblingCalls && siblingCalls.length > 0) {
-    console.log(`[BATCH] ${siblingCalls.length} sibling(s) still active — holding agent ${agentId}`)
-    return
+    if (siblingCalls && siblingCalls.length > 0) {
+      console.log(`[BATCH] ${siblingCalls.length} sibling(s) still active — holding agent ${agentId}`)
+      return
+    }
+
+    console.log(`[BATCH] All siblings resolved — releasing agent ${agentId} to READY`)
+    await supabaseClient
+      .from('agent_sessions')
+      .update({ state: 'READY', active_call_id: null, updated_at: new Date().toISOString() })
+      .eq('agent_id', agentId)
+  } catch (err) {
+    console.error(`[BATCH] maybeReleaseBatchAgent error for agent ${agentId}:`, err)
+    // Fallback: release agent directly to avoid it being stuck until healer fires
+    try {
+      await supabaseClient
+        .from('agent_sessions')
+        .update({ state: 'READY', active_call_id: null, updated_at: new Date().toISOString() })
+        .eq('agent_id', agentId)
+    } catch (fallbackErr) {
+      console.error(`[BATCH] Fallback release also failed for agent ${agentId}:`, fallbackErr)
+    }
   }
-
-  console.log(`[BATCH] All siblings resolved — releasing agent ${agentId} to READY`)
-  await supabaseClient
-    .from('agent_sessions')
-    .update({ state: 'READY', active_call_id: null, updated_at: new Date().toISOString() })
-    .eq('agent_id', agentId)
 }
 
 async function releaseAgentForCall(call: { group_id?: string | null; agent_id?: string | null }) {
@@ -666,6 +686,7 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
 
             if (call) {
               await releaseAgentForCall(call)
+              if (call.agent_id) await setAgentCooldown(call.agent_id)
             }
           }
         }
@@ -697,16 +718,22 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
                 .update({ status: 'completed', ended_at: now, wrapped_at: now })
                 .eq('id', call.id)
             } else {
-              await supabase
-                .from('calls')
-                .update({
-                  status: call.lead_leg_id ? 'lead_dialing' : 'failed',
-                  ended_at: call.lead_leg_id ? null : now,
-                  wrapped_at: call.lead_leg_id ? null : now,
-                })
-                .eq('id', call.id)
-
-              if (!call.lead_leg_id) await markLeadFailed(call.lead_id)
+              if (call.lead_leg_id) {
+                // Agent dropped before bridge but lead leg exists (lead is ringing or answered).
+                // Hang up the lead leg immediately — don't leave the lead on a dead line.
+                await telnyxAction(call.lead_leg_id, 'hangup')
+                await supabase
+                  .from('calls')
+                  .update({ status: 'failed', ended_at: now, wrapped_at: now })
+                  .eq('id', call.id)
+                await markLeadFailed(call.lead_id)
+              } else {
+                await supabase
+                  .from('calls')
+                  .update({ status: 'failed', ended_at: now, wrapped_at: now })
+                  .eq('id', call.id)
+                await markLeadFailed(call.lead_id)
+              }
             }
 
             await releaseAgentForCall(call)
@@ -739,6 +766,8 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
               }
 
               await releaseAgentForCall(call)
+              // Cooldown after no-answer: prevent ticker from immediately re-queuing the same agent
+              if (!completed && call.agent_id) await setAgentCooldown(call.agent_id)
             }
           }
 

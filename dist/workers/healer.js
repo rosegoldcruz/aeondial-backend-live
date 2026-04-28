@@ -125,7 +125,7 @@ async function cleanupStaleBridgedCalls() {
                         .from('agent_sessions')
                         .update({ state: 'READY', active_call_id: null, updated_at: now.toISOString() })
                         .eq('agent_id', call.agent_id)
-                        .in('state', ['IN_CALL', 'BUSY']);
+                        .in('state', ['IN_CALL', 'RESERVED']);
                     if (releaseCount)
                         console.log(`[HEALER] Released agent ${call.agent_id} from stale bridged call ${call.id}`);
                 }
