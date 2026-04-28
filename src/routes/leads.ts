@@ -133,20 +133,60 @@ export async function leadRoutes(app: FastifyInstance) {
     try {
       records = parseCsv(csvText);
     } catch {
-      return reply.status(400).send({ error: 'Invalid CSV format' });
+      return reply.status(422).send({ error: 'Invalid CSV format' });
     }
 
-    const leads: Record<string, unknown>[] = [];
-    const skipped: string[] = [];
+    // Valid IANA timezone list (subset for quick validation)
+    const VALID_TIMEZONES = new Set([
+      'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
+      'America/Anchorage', 'Pacific/Honolulu', 'America/Phoenix',
+      'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Asia/Tokyo', 'Australia/Sydney',
+      'UTC', 'GMT',
+      // Add more as needed or trust Postgres to validate
+    ]);
 
-    for (const row of records) {
+    const leads: Record<string, unknown>[] = [];
+    const errors: Array<{ row: number; phone: string; reason: string }> = [];
+    const seenPhones = new Set<string>();
+
+    // Get existing phones in this campaign for duplicate check
+    const { data: existingLeads } = await supabase
+      .from('leads')
+      .select('phone')
+      .eq('campaign_id', campaignId);
+    const existingPhones = new Set((existingLeads ?? []).map(l => l.phone));
+
+    for (let rowNum = 0; rowNum < records.length; rowNum++) {
+      const row = records[rowNum];
       const rawPhone = pick(row, ['phone_e164', 'phone', 'Phone', 'Cellphone', 'cellphone', 'mobile', 'Mobile']) ?? '';
       const phone = normalizePhone(rawPhone);
 
-      if (!phone) {
-        skipped.push(rawPhone);
+      // ── VALIDATION: Phone format ──
+      if (!phone || !/^\+1[2-9]\d{9}$/.test(phone)) {
+        errors.push({ row: rowNum + 1, phone: rawPhone || '(blank)', reason: 'Invalid US phone format' });
         continue;
       }
+
+      // ── VALIDATION: Duplicate in batch ──
+      if (seenPhones.has(phone)) {
+        errors.push({ row: rowNum + 1, phone, reason: 'Duplicate in this batch' });
+        continue;
+      }
+
+      // ── VALIDATION: Duplicate in campaign ──
+      if (existingPhones.has(phone)) {
+        errors.push({ row: rowNum + 1, phone, reason: 'Already exists in this campaign' });
+        continue;
+      }
+
+      // ── VALIDATION: Timezone (if provided) ──
+      const timezone = pick(row, ['timezone', 'Timezone']) ?? null;
+      if (timezone && !VALID_TIMEZONES.has(timezone)) {
+        // Log warning but don't reject — timezone validation is lenient
+        console.warn(`[import] Row ${rowNum + 1}: Unknown timezone "${timezone}" — will be validated by database`);
+      }
+
+      seenPhones.add(phone);
 
       leads.push({
         campaign_id: campaignId,
@@ -160,7 +200,7 @@ export async function leadRoutes(app: FastifyInstance) {
         state: pick(row, ['state', 'State']) ?? null,
         country: pick(row, ['country', 'Country']) ?? null,
         zip: pick(row, ['zip', 'Zip', 'ZIP']) ?? null,
-        timezone: pick(row, ['timezone', 'Timezone']) ?? null,
+        timezone: timezone ?? null,
         timezone_source: pick(row, ['timezone_source']) ?? null,
         consent_source: pick(row, ['consent_source']) || pick(row, ['source_list']) || 'IVT Crypto Master list - affiliated partner opt-in',
         consent_date: new Date().toISOString(),
@@ -169,28 +209,28 @@ export async function leadRoutes(app: FastifyInstance) {
       });
     }
 
-    if (leads.length === 0) {
-      return reply.status(400).send({ error: 'No valid leads found', skipped });
-    }
-
+    // ── RESPONSE: Always HTTP 200 (unless CSV itself is malformed → 422) ──
     const CHUNK = 500;
     let inserted = 0;
-    const errors: string[] = [];
+    const insertErrors: string[] = [];
 
     for (let i = 0; i < leads.length; i += CHUNK) {
       const chunk = leads.slice(i, i + CHUNK);
       const { error } = await supabase.from('leads').insert(chunk);
       if (error) {
-        errors.push(error.message);
+        insertErrors.push(error.message);
       } else {
         inserted += chunk.length;
       }
     }
 
-    if (inserted === 0 && errors.length) {
-      return reply.status(500).send({ error: errors[0], inserted, skipped: skipped.length, total: records.length });
-    }
-
-    return reply.send({ success: true, inserted, skipped: skipped.length, total: records.length, campaign_id: campaignId, errors });
+    return reply.send({
+      accepted: inserted,
+      rejected: errors.length,
+      errors: errors,
+      total_rows: records.length,
+      campaign_id: campaignId,
+      insert_errors: insertErrors.length > 0 ? insertErrors : undefined,
+    });
   });
 }

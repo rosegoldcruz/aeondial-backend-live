@@ -102,13 +102,16 @@ export async function callRoutes(app) {
             wrapped_at: new Date().toISOString(),
         })
             .eq('id', callId);
-        await supabase
+        const { count: wrapupCount } = await supabase
             .from('agent_sessions')
             .update({
             state: 'WRAP_UP',
             updated_at: new Date().toISOString(),
         })
-            .eq('agent_id', agentId);
+            .eq('agent_id', agentId)
+            .in('state', ['IN_CALL', 'RESERVED', 'BUSY']);
+        if (!wrapupCount)
+            console.warn(`[calls] Agent ${agentId} wrapup transition rejected`);
         // Update lead status
         let leadStatus = 'disposed';
         if (disposition === 'Do Not Call')
@@ -148,14 +151,17 @@ export async function callRoutes(app) {
                 status: 'pending',
             });
         }
-        await supabase
+        const { count: readyCount } = await supabase
             .from('agent_sessions')
             .update({
             state: 'READY',
             active_call_id: null,
             updated_at: new Date().toISOString(),
         })
-            .eq('agent_id', agentId);
+            .eq('agent_id', agentId)
+            .eq('state', 'WRAP_UP');
+        if (!readyCount)
+            console.warn(`[calls] Agent ${agentId} READY transition rejected`);
         await supabase.from('audit_events').insert({
             entity_type: 'call',
             entity_id: callId,

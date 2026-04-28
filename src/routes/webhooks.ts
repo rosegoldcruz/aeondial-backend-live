@@ -153,10 +153,20 @@ async function dialReadyAgentForLead(leadCallControlId: string, callId: string, 
   if (!dial.ok || !agentLegId) return false
 
   const now = new Date().toISOString()
-  await supabase
+
+  // ── ATOMIC: Atomically mark agent as RESERVED with RETURNING
+  const { data: reservedAgent, error: reserveError } = await supabase
     .from('agent_sessions')
     .update({ state: 'RESERVED', active_call_id: callId, updated_at: now })
     .eq('agent_id', agent.id)
+    .eq('state', 'READY') // guard: only if still READY
+    .select('agent_id')
+    .single()
+
+  if (!reservedAgent) {
+    console.warn(`[dialReadyAgent] Agent ${agent.id} no longer READY — skipping`)
+    return false
+  }
 
   await supabase
     .from('calls')
@@ -295,7 +305,6 @@ async function saveInboundRecording(callData: any, clientState: ClientState) {
     callData?.public_recording_url ??
     callData?.download_url ??
     callData?.recording_urls?.mp3 ??
-    callData?.recording_urls?.wav ??
     null
 
   const callerNumber = clientState.caller_number ?? getPhoneNumber(callData?.from)
@@ -360,6 +369,37 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
     const event = payload?.data?.event_type
     const callData = payload?.data?.payload
 
+    // ── DEDUPLICATION: prevent double-execution on Telnyx retries ──
+    const telnyxEventId = payload?.id ?? payload?.data?.event_id
+    if (telnyxEventId) {
+      try {
+        // Attempt INSERT into webhook_dedup — if it conflicts (duplicate key), we've seen this before
+        await supabase.from('webhook_dedup').insert({ id: telnyxEventId })
+        // Insert succeeded, this is a new event — continue processing
+      } catch (err: any) {
+        // Likely a UNIQUE constraint violation (duplicate key) — we've already processed this event
+        const isDuplicateKey = err?.code === '23505' || err?.message?.includes('duplicate key') || err?.message?.includes('unique')
+        if (isDuplicateKey) {
+          console.log(`[webhook] Duplicate event detected: ${telnyxEventId} — ignoring`)
+          return reply.status(200).send({ ok: true })
+        }
+        // Log unexpected errors but continue (table may not exist yet)
+        console.error(`[webhook] Dedup insert error (non-duplicate):`, err)
+      }
+
+      // Async cleanup: delete dedup entries older than 24 hours (fire-and-forget)
+      setImmediate(async () => {
+        try {
+          await supabase
+            .from('webhook_dedup')
+            .delete()
+            .lt('received_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
+        } catch (err) {
+          console.error('[webhook] Cleanup error:', err)
+        }
+      })
+    }
+
     if (!event || !callData) return reply.status(200).send({ ok: true })
 
     const callControlId = callData.call_control_id as string
@@ -367,37 +407,38 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
 
     console.log(`[webhook] ${event} | leg: ${callControlId} | type: ${clientState.leg_type ?? clientState.action ?? 'unknown'}`)
 
+    // All webhook processing logic moved into setImmediate for instant ACK
+    setImmediate(async () => {
+
     switch (event) {
       case 'call.initiated': {
         const direction = callData.direction as string
         if (direction !== 'inbound') break
 
-        const { data: readySession } = await supabase
+        // ── ATOMIC: Atomically reserve an inbound-ready agent with RETURNING
+        const { data: reservedSessions } = await supabase
           .from('agent_sessions')
-          .select('agent_id, agents(telnyx_sip_username)')
+          .update({ state: 'RESERVED', updated_at: new Date().toISOString() })
           .eq('state', 'READY')
           .is('active_call_id', null)
+          .order('last_ready_at', { ascending: true, nullsFirst: false })
           .limit(1)
+          .select('agent_id, agents(telnyx_sip_username)')
           .single()
 
-        if (readySession) {
-          const sipUsername = (readySession as any).agents?.telnyx_sip_username
+        if (reservedSessions) {
+          const sipUsername = (reservedSessions as any).agents?.telnyx_sip_username
           const now = new Date().toISOString()
 
           await telnyxAction(callControlId, 'answer')
           await telnyxAction(callControlId, 'transfer', {
             to: `sip:${sipUsername}@aeondial.sip.telnyx.com`,
             webhook_url: process.env.TELNYX_WEBHOOK_URL,
-            client_state: encodeState({ action: 'inbound_bridge', agent_id: readySession.agent_id }),
+            client_state: encodeState({ action: 'inbound_bridge', agent_id: reservedSessions.agent_id }),
           })
 
-          await supabase
-            .from('agent_sessions')
-            .update({ state: 'RESERVED', updated_at: now })
-            .eq('agent_id', readySession.agent_id)
-
           await supabase.from('calls').insert({
-            agent_id: readySession.agent_id,
+            agent_id: reservedSessions.agent_id,
             direction: 'inbound',
             status: 'agent_dialing',
             agent_leg_id: callControlId,
@@ -421,10 +462,12 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
           const now = new Date().toISOString()
 
           if (clientState.action === 'inbound_agent') {
-            await supabase
+            const { count: inCallCount } = await supabase
               .from('agent_sessions')
               .update({ state: 'IN_CALL', active_call_id: clientState.call_id, updated_at: now })
               .eq('agent_id', clientState.agent_id)
+              .eq('state', 'RESERVED')
+            if (!inCallCount) console.warn(`[webhook] Agent ${clientState.agent_id} state IN_CALL rejected`)
 
             await supabase
               .from('calls')
@@ -434,10 +477,12 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
           }
 
           const leadIds = clientState.lead_ids ?? []
-          await supabase
+          const { count: reservedCount } = await supabase
             .from('agent_sessions')
             .update({ state: 'RESERVED', active_call_id: clientState.call_id, updated_at: now })
             .eq('agent_id', clientState.agent_id)
+            .in('state', ['REGISTERED', 'READY'])
+          if (!reservedCount) console.warn(`[webhook] Agent ${clientState.agent_id} state RESERVED rejected`)
 
           await supabase
             .from('calls')
@@ -580,11 +625,22 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
         if (getMachineDetectionResult(callData) === 'answering_machine' && clientState.call_id) {
           const { data: call } = await supabase
             .from('calls')
-            .select('id, lead_id, status')
+            .select('id, lead_id, status, agent_id, agent_leg_id')
             .eq('id', clientState.call_id)
             .single()
 
           if (call?.lead_id && !isTerminalCallStatus(call.status) && call.status !== 'bridged') {
+            // ── AMD NO BLIND DROP: Check if READY agent available ──
+            // If agent exists, bridge instead of blind drop
+            if (call.agent_id && call.agent_leg_id && call.status === 'lead_dialing') {
+              const bridged = await bridgeReservedAgentToLead(call, callControlId)
+              if (bridged) {
+                console.log(`[AMD] Machine detected but agent available — bridging call ${call.id}`)
+                break
+              }
+            }
+
+            // No agent available or bridge failed — drop voicemail
             await dropVoicemail(callControlId, call.id, call.lead_id, 'auto_voicemail')
           }
         }
@@ -690,11 +746,12 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
         }
 
         if (clientState.action === 'inbound_bridge' && clientState.agent_id) {
-          await supabase
+          const { count: releaseCount } = await supabase
             .from('agent_sessions')
             .update({ state: 'READY', active_call_id: null, updated_at: now })
             .eq('agent_id', clientState.agent_id)
             .in('state', ['RESERVED', 'IN_CALL'])
+          if (!releaseCount) console.warn(`[webhook] Agent ${clientState.agent_id} READY release rejected`)
 
           await supabase
             .from('calls')
@@ -711,6 +768,7 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
       default:
         break
     }
+    }) // end setImmediate
 
     return reply.status(200).send({ ok: true })
   }

@@ -258,11 +258,20 @@ const dialWorker = new Worker(
       return;
     }
 
-    // 3. Reserve agent
-    await supabase
+    // 3. Reserve agent atomically — if RETURNING is empty, agent was already taken, skip
+    const { data: reservedSession, error: reserveError } = await supabase
       .from('agent_sessions')
       .update({ state: 'RESERVED', updated_at: new Date().toISOString() })
-      .eq('agent_id', agentId);
+      .eq('agent_id', agentId)
+      .eq('state', 'READY') // guard: only if still READY
+      .select('agent_id')
+      .single()
+
+    if (!reservedSession || reserveError) {
+      console.log(`[WORKER] Agent ${agentId} no longer READY — skipping`)
+      await releaseLock(agentId)
+      return
+    };
 
     // 4. Pick next lead from active campaign and enforce attempts cap
     const { data: campaign } = await supabase
@@ -285,22 +294,14 @@ const dialWorker = new Worker(
 
     const maxAttempts = Number(campaign.max_attempts ?? 3);
 
-    let leadQuery = supabase
-      .from('leads')
-      .select('id, phone, first_name, last_name, campaign_id, attempts, timezone')
-      .eq('campaign_id', campaign.id)
-      .eq('status', 'pending')
-      .is('assigned_agent_id', null)
-      .or('callback_at.is.null,callback_at.lte.' + new Date().toISOString())
-      .lt('attempts', maxAttempts)
-      .neq('status', 'dnc');
-
-    // TEST MODE: only dial the test number
+    // ── SKIP LOCKED: Use RPC function for atomic lead fetching with SKIP LOCKED
+    // In test mode, filter by test phone numbers
+    let filterPhones: string[] | null = null;
     if (DIALER_MODE !== 'production') {
       if (TEST_PHONE_NUMBERS.length > 0) {
-        leadQuery = leadQuery.in('phone', TEST_PHONE_NUMBERS);
+        filterPhones = TEST_PHONE_NUMBERS;
       } else if (TEST_PHONE_NUMBER) {
-        leadQuery = leadQuery.eq('phone', TEST_PHONE_NUMBER);
+        filterPhones = [TEST_PHONE_NUMBER];
       } else {
         console.warn(`[WORKER] DIALER_MODE=${DIALER_MODE} but no test phone numbers are set — skipping`);
         await supabase
@@ -312,33 +313,30 @@ const dialWorker = new Worker(
       }
     }
 
-    const { data: regularCandidates } = await leadQuery
-      .order('created_at', { ascending: true })
-      .limit(25);
+    // Fetch candidates with SKIP LOCKED (prevents double-dial in concurrent workers)
+    const { data: allCandidates, error: fetchError } = await supabase.rpc('fetch_leads_skip_locked', {
+      p_campaign_id: campaign.id,
+      p_max_attempts: maxAttempts,
+      p_batch_size: 25,
+    });
 
-    let candidateLeads = regularCandidates ?? [];
-
-    // Always fetch test phone numbers explicitly — they may be newer than the
-    // top-25 oldest leads and would otherwise never be reached by the query.
-    if (TEST_PHONE_NUMBERS.length > 0) {
-      const { data: testCandidates } = await supabase
-        .from('leads')
-        .select('id, phone, first_name, last_name, campaign_id, attempts, timezone')
-        .eq('campaign_id', campaign.id)
-        .eq('status', 'pending')
-        .is('assigned_agent_id', null)
-        .lt('attempts', maxAttempts)
-        .in('phone', TEST_PHONE_NUMBERS);
-
-      const existingIds = new Set(candidateLeads.map((l) => l.id));
-      for (const lead of testCandidates ?? []) {
-        if (!existingIds.has(lead.id)) {
-          candidateLeads.push(lead);
-        }
-      }
+    if (fetchError) {
+      console.error(`[WORKER] Lead fetch error: ${fetchError.message}`);
+      await supabase
+        .from('agent_sessions')
+        .update({ state: 'READY', updated_at: new Date().toISOString() })
+        .eq('agent_id', agentId);
+      await releaseLock(agentId);
+      return;
     }
 
-    const leads = candidateLeads
+    // Filter by test phones if in test mode
+    let leads = (allCandidates ?? []) as any[];
+    if (filterPhones) {
+      leads = leads.filter(lead => filterPhones!.includes(lead.phone));
+    }
+
+    leads = leads
       .filter((lead) => {
         if (isTestPhoneNumber(lead.phone)) {
           return true;

@@ -118,10 +118,18 @@ async function dialReadyAgentForLead(leadCallControlId, callId, leadId) {
     if (!dial.ok || !agentLegId)
         return false;
     const now = new Date().toISOString();
-    await supabase
+    // ── ATOMIC: Atomically mark agent as RESERVED with RETURNING
+    const { data: reservedAgent, error: reserveError } = await supabase
         .from('agent_sessions')
         .update({ state: 'RESERVED', active_call_id: callId, updated_at: now })
-        .eq('agent_id', agent.id);
+        .eq('agent_id', agent.id)
+        .eq('state', 'READY') // guard: only if still READY
+        .select('agent_id')
+        .single();
+    if (!reservedAgent) {
+        console.warn(`[dialReadyAgent] Agent ${agent.id} no longer READY — skipping`);
+        return false;
+    }
     await supabase
         .from('calls')
         .update({ agent_id: agent.id, agent_leg_id: agentLegId, status: 'agent_dialing' })
@@ -240,7 +248,6 @@ async function saveInboundRecording(callData, clientState) {
         callData?.public_recording_url ??
         callData?.download_url ??
         callData?.recording_urls?.mp3 ??
-        callData?.recording_urls?.wav ??
         null;
     const callerNumber = clientState.caller_number ?? getPhoneNumber(callData?.from);
     const durationSeconds = callData?.duration_secs ?? callData?.duration_seconds ?? callData?.recording_duration_secs ?? null;
@@ -295,308 +302,359 @@ export async function telnyxWebhookRoutes(app) {
         const payload = req.body;
         const event = payload?.data?.event_type;
         const callData = payload?.data?.payload;
+        // ── DEDUPLICATION: prevent double-execution on Telnyx retries ──
+        const telnyxEventId = payload?.id ?? payload?.data?.event_id;
+        if (telnyxEventId) {
+            try {
+                // Attempt INSERT into webhook_dedup — if it conflicts (duplicate key), we've seen this before
+                await supabase.from('webhook_dedup').insert({ id: telnyxEventId });
+                // Insert succeeded, this is a new event — continue processing
+            }
+            catch (err) {
+                // Likely a UNIQUE constraint violation (duplicate key) — we've already processed this event
+                const isDuplicateKey = err?.code === '23505' || err?.message?.includes('duplicate key') || err?.message?.includes('unique');
+                if (isDuplicateKey) {
+                    console.log(`[webhook] Duplicate event detected: ${telnyxEventId} — ignoring`);
+                    return reply.status(200).send({ ok: true });
+                }
+                // Log unexpected errors but continue (table may not exist yet)
+                console.error(`[webhook] Dedup insert error (non-duplicate):`, err);
+            }
+            // Async cleanup: delete dedup entries older than 24 hours (fire-and-forget)
+            setImmediate(async () => {
+                try {
+                    await supabase
+                        .from('webhook_dedup')
+                        .delete()
+                        .lt('received_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+                }
+                catch (err) {
+                    console.error('[webhook] Cleanup error:', err);
+                }
+            });
+        }
         if (!event || !callData)
             return reply.status(200).send({ ok: true });
         const callControlId = callData.call_control_id;
         const clientState = decodeState(callData.client_state);
         console.log(`[webhook] ${event} | leg: ${callControlId} | type: ${clientState.leg_type ?? clientState.action ?? 'unknown'}`);
-        switch (event) {
-            case 'call.initiated': {
-                const direction = callData.direction;
-                if (direction !== 'inbound')
-                    break;
-                const { data: readySession } = await supabase
-                    .from('agent_sessions')
-                    .select('agent_id, agents(telnyx_sip_username)')
-                    .eq('state', 'READY')
-                    .is('active_call_id', null)
-                    .limit(1)
-                    .single();
-                if (readySession) {
-                    const sipUsername = readySession.agents?.telnyx_sip_username;
-                    const now = new Date().toISOString();
-                    await telnyxAction(callControlId, 'answer');
-                    await telnyxAction(callControlId, 'transfer', {
-                        to: `sip:${sipUsername}@aeondial.sip.telnyx.com`,
-                        webhook_url: process.env.TELNYX_WEBHOOK_URL,
-                        client_state: encodeState({ action: 'inbound_bridge', agent_id: readySession.agent_id }),
-                    });
-                    await supabase
-                        .from('agent_sessions')
-                        .update({ state: 'RESERVED', updated_at: now })
-                        .eq('agent_id', readySession.agent_id);
-                    await supabase.from('calls').insert({
-                        agent_id: readySession.agent_id,
-                        direction: 'inbound',
-                        status: 'agent_dialing',
-                        agent_leg_id: callControlId,
-                        started_at: now,
-                    });
-                }
-                else {
-                    await telnyxAction(callControlId, 'answer');
-                    await telnyxAction(callControlId, 'transfer', {
-                        to: '+18883682502',
-                        from: '+16232833337',
-                        webhook_url: process.env.TELNYX_WEBHOOK_URL,
-                        client_state: encodeState({ action: 'failover_to_chris' }),
-                    });
-                }
-                break;
-            }
-            case 'call.answered': {
-                if (clientState.leg_type === 'agent' && clientState.agent_id && clientState.call_id) {
-                    const now = new Date().toISOString();
-                    if (clientState.action === 'inbound_agent') {
-                        await supabase
-                            .from('agent_sessions')
-                            .update({ state: 'IN_CALL', active_call_id: clientState.call_id, updated_at: now })
-                            .eq('agent_id', clientState.agent_id);
-                        await supabase
-                            .from('calls')
-                            .update({ status: 'bridged', agent_leg_id: callControlId, answered_at: now, bridged_at: now })
-                            .eq('id', clientState.call_id);
+        // All webhook processing logic moved into setImmediate for instant ACK
+        setImmediate(async () => {
+            switch (event) {
+                case 'call.initiated': {
+                    const direction = callData.direction;
+                    if (direction !== 'inbound')
                         break;
-                    }
-                    const leadIds = clientState.lead_ids ?? [];
-                    await supabase
+                    // ── ATOMIC: Atomically reserve an inbound-ready agent with RETURNING
+                    const { data: reservedSessions } = await supabase
                         .from('agent_sessions')
-                        .update({ state: 'RESERVED', active_call_id: clientState.call_id, updated_at: now })
-                        .eq('agent_id', clientState.agent_id);
-                    await supabase
-                        .from('calls')
-                        .update({ status: 'agent_answered', agent_leg_id: callControlId })
-                        .in('lead_id', leadIds)
-                        .eq('agent_id', clientState.agent_id)
-                        .in('status', ['created', 'agent_dialing']);
-                    const { data: calls } = await supabase
-                        .from('calls')
-                        .select('id, lead_id, leads(phone)')
-                        .in('lead_id', leadIds)
-                        .eq('agent_id', clientState.agent_id)
-                        .in('status', ['agent_answered']);
-                    for (const call of calls ?? []) {
-                        const phone = call.leads?.phone;
-                        if (!phone) {
-                            await markLeadFailed(call.lead_id);
-                            continue;
-                        }
-                        const leadDial = await telnyxDial({
-                            connection_id: process.env.TELNYX_CONNECTION_ID,
-                            to: phone,
-                            from: process.env.TELNYX_OUTBOUND_NUMBER,
+                        .update({ state: 'RESERVED', updated_at: new Date().toISOString() })
+                        .eq('state', 'READY')
+                        .is('active_call_id', null)
+                        .order('last_ready_at', { ascending: true, nullsFirst: false })
+                        .limit(1)
+                        .select('agent_id, agents(telnyx_sip_username)')
+                        .single();
+                    if (reservedSessions) {
+                        const sipUsername = reservedSessions.agents?.telnyx_sip_username;
+                        const now = new Date().toISOString();
+                        await telnyxAction(callControlId, 'answer');
+                        await telnyxAction(callControlId, 'transfer', {
+                            to: `sip:${sipUsername}@aeondial.sip.telnyx.com`,
                             webhook_url: process.env.TELNYX_WEBHOOK_URL,
-                            answering_machine_detection: 'detect',
-                            client_state: encodeState({
-                                leg_type: 'lead',
-                                call_id: call.id,
-                                agent_id: clientState.agent_id,
-                            }),
+                            client_state: encodeState({ action: 'inbound_bridge', agent_id: reservedSessions.agent_id }),
                         });
-                        const leadLegId = leadDial.data?.call_control_id ?? leadDial.data?.callControlId;
-                        if (leadDial.ok && leadLegId) {
-                            await supabase
-                                .from('calls')
-                                .update({ status: 'lead_dialing', lead_leg_id: leadLegId })
-                                .eq('id', call.id);
-                        }
-                        else {
-                            await supabase
-                                .from('calls')
-                                .update({ status: 'failed', ended_at: new Date().toISOString(), wrapped_at: new Date().toISOString() })
-                                .eq('id', call.id);
-                            await markLeadFailed(call.lead_id);
-                        }
+                        await supabase.from('calls').insert({
+                            agent_id: reservedSessions.agent_id,
+                            direction: 'inbound',
+                            status: 'agent_dialing',
+                            agent_leg_id: callControlId,
+                            started_at: now,
+                        });
+                    }
+                    else {
+                        await telnyxAction(callControlId, 'answer');
+                        await telnyxAction(callControlId, 'transfer', {
+                            to: '+18883682502',
+                            from: '+16232833337',
+                            webhook_url: process.env.TELNYX_WEBHOOK_URL,
+                            client_state: encodeState({ action: 'failover_to_chris' }),
+                        });
                     }
                     break;
                 }
-                if (clientState.leg_type === 'lead' && clientState.call_id) {
-                    const now = new Date().toISOString();
-                    const { data: call } = await supabase
-                        .from('calls')
-                        .select('id, lead_id, agent_id, group_id, agent_leg_id, status, answered_at')
-                        .eq('id', clientState.call_id)
-                        .single();
-                    if (!call) {
-                        await telnyxAction(callControlId, 'hangup');
-                        break;
-                    }
-                    await supabase
-                        .from('calls')
-                        .update({ lead_leg_id: callControlId, answered_at: call.answered_at ?? now })
-                        .eq('id', call.id);
-                    const bridged = await bridgeReservedAgentToLead(call, callControlId);
-                    if (!bridged) {
-                        await playLiveAnswerIvr(callControlId, call.id, call.lead_id);
-                    }
-                }
-                break;
-            }
-            case 'call.gather.ended':
-            case 'call.dtmf.received': {
-                if (clientState.action === 'ivr_response' && clientState.call_id) {
-                    const digit = getGatherDigit(callData);
-                    const now = new Date().toISOString();
-                    const { data: call } = await supabase
-                        .from('calls')
-                        .select('id, lead_id, agent_id, status')
-                        .eq('id', clientState.call_id)
-                        .single();
-                    if (!call) {
-                        await telnyxAction(callControlId, 'hangup');
-                        break;
-                    }
-                    if (digit === '1') {
-                        const agentDialing = await dialReadyAgentForLead(callControlId, call.id, call.lead_id);
-                        if (!agentDialing) {
-                            await markVoicemailAndHangup(callControlId, call.id, call.lead_id);
-                        }
-                        break;
-                    }
-                    if (digit === '2') {
-                        if (call.lead_id) {
+                case 'call.answered': {
+                    if (clientState.leg_type === 'agent' && clientState.agent_id && clientState.call_id) {
+                        const now = new Date().toISOString();
+                        if (clientState.action === 'inbound_agent') {
+                            const { count: inCallCount } = await supabase
+                                .from('agent_sessions')
+                                .update({ state: 'IN_CALL', active_call_id: clientState.call_id, updated_at: now })
+                                .eq('agent_id', clientState.agent_id)
+                                .eq('state', 'RESERVED');
+                            if (!inCallCount)
+                                console.warn(`[webhook] Agent ${clientState.agent_id} state IN_CALL rejected`);
                             await supabase
-                                .from('leads')
-                                .update({ status: 'dnc', dnc_source: 'ivr_optout', dnc_at: now })
-                                .eq('id', call.lead_id);
+                                .from('calls')
+                                .update({ status: 'bridged', agent_leg_id: callControlId, answered_at: now, bridged_at: now })
+                                .eq('id', clientState.call_id);
+                            break;
                         }
+                        const leadIds = clientState.lead_ids ?? [];
+                        const { count: reservedCount } = await supabase
+                            .from('agent_sessions')
+                            .update({ state: 'RESERVED', active_call_id: clientState.call_id, updated_at: now })
+                            .eq('agent_id', clientState.agent_id)
+                            .in('state', ['REGISTERED', 'READY']);
+                        if (!reservedCount)
+                            console.warn(`[webhook] Agent ${clientState.agent_id} state RESERVED rejected`);
                         await supabase
                             .from('calls')
-                            .update({ disposition: 'Do Not Call', ended_at: now, wrapped_at: now })
-                            .eq('id', call.id);
-                        await telnyxAction(callControlId, 'hangup');
+                            .update({ status: 'agent_answered', agent_leg_id: callControlId })
+                            .in('lead_id', leadIds)
+                            .eq('agent_id', clientState.agent_id)
+                            .in('status', ['created', 'agent_dialing']);
+                        const { data: calls } = await supabase
+                            .from('calls')
+                            .select('id, lead_id, leads(phone)')
+                            .in('lead_id', leadIds)
+                            .eq('agent_id', clientState.agent_id)
+                            .in('status', ['agent_answered']);
+                        for (const call of calls ?? []) {
+                            const phone = call.leads?.phone;
+                            if (!phone) {
+                                await markLeadFailed(call.lead_id);
+                                continue;
+                            }
+                            const leadDial = await telnyxDial({
+                                connection_id: process.env.TELNYX_CONNECTION_ID,
+                                to: phone,
+                                from: process.env.TELNYX_OUTBOUND_NUMBER,
+                                webhook_url: process.env.TELNYX_WEBHOOK_URL,
+                                answering_machine_detection: 'detect',
+                                client_state: encodeState({
+                                    leg_type: 'lead',
+                                    call_id: call.id,
+                                    agent_id: clientState.agent_id,
+                                }),
+                            });
+                            const leadLegId = leadDial.data?.call_control_id ?? leadDial.data?.callControlId;
+                            if (leadDial.ok && leadLegId) {
+                                await supabase
+                                    .from('calls')
+                                    .update({ status: 'lead_dialing', lead_leg_id: leadLegId })
+                                    .eq('id', call.id);
+                            }
+                            else {
+                                await supabase
+                                    .from('calls')
+                                    .update({ status: 'failed', ended_at: new Date().toISOString(), wrapped_at: new Date().toISOString() })
+                                    .eq('id', call.id);
+                                await markLeadFailed(call.lead_id);
+                            }
+                        }
                         break;
                     }
-                    await markVoicemailAndHangup(callControlId, call.id, call.lead_id);
-                    if (call.agent_id) {
-                        await supabase
-                            .from('agent_sessions')
-                            .update({
-                            state: 'READY',
-                            active_call_id: null,
-                            updated_at: new Date().toISOString(),
-                        })
-                            .eq('agent_id', call.agent_id);
-                    }
-                }
-                break;
-            }
-            case 'call.machine.detection.ended': {
-                if (getMachineDetectionResult(callData) === 'answering_machine' && clientState.call_id) {
-                    const { data: call } = await supabase
-                        .from('calls')
-                        .select('id, lead_id, status')
-                        .eq('id', clientState.call_id)
-                        .single();
-                    if (call?.lead_id && !isTerminalCallStatus(call.status) && call.status !== 'bridged') {
-                        await dropVoicemail(callControlId, call.id, call.lead_id, 'auto_voicemail');
-                    }
-                }
-                break;
-            }
-            case 'call.playback.ended': {
-                if (['auto_voicemail', 'ivr_voicemail', 'manual_voicemail'].includes(clientState.action ?? '') && clientState.call_id) {
-                    const now = new Date().toISOString();
-                    await telnyxAction(callControlId, 'hangup');
-                    await supabase
-                        .from('calls')
-                        .update({ ended_at: now, wrapped_at: now })
-                        .eq('id', clientState.call_id);
-                    if (clientState.action === 'auto_voicemail' || clientState.action === 'ivr_voicemail') {
+                    if (clientState.leg_type === 'lead' && clientState.call_id) {
+                        const now = new Date().toISOString();
                         const { data: call } = await supabase
                             .from('calls')
-                            .select('group_id, agent_id')
+                            .select('id, lead_id, agent_id, group_id, agent_leg_id, status, answered_at')
                             .eq('id', clientState.call_id)
                             .single();
-                        if (call) {
-                            await releaseAgentForCall(call);
+                        if (!call) {
+                            await telnyxAction(callControlId, 'hangup');
+                            break;
                         }
-                    }
-                }
-                break;
-            }
-            case 'call.recording.saved':
-            case 'call.recording.ended': {
-                await saveInboundRecording(callData, clientState);
-                break;
-            }
-            case 'call.hangup': {
-                const now = new Date().toISOString();
-                if (clientState.leg_type === 'agent' && clientState.agent_id) {
-                    const { data: calls } = await supabase
-                        .from('calls')
-                        .select('id, lead_id, agent_id, group_id, status, lead_leg_id, answered_at')
-                        .eq('agent_leg_id', callControlId)
-                        .in('status', ['created', 'agent_dialing', 'agent_answered', 'lead_dialing', 'bridged']);
-                    for (const call of calls ?? []) {
-                        if (call.status === 'bridged') {
-                            if (call.lead_leg_id)
-                                await telnyxAction(call.lead_leg_id, 'hangup');
-                            await supabase
-                                .from('calls')
-                                .update({ status: 'completed', ended_at: now, wrapped_at: now })
-                                .eq('id', call.id);
+                        await supabase
+                            .from('calls')
+                            .update({ lead_leg_id: callControlId, answered_at: call.answered_at ?? now })
+                            .eq('id', call.id);
+                        const bridged = await bridgeReservedAgentToLead(call, callControlId);
+                        if (!bridged) {
+                            await playLiveAnswerIvr(callControlId, call.id, call.lead_id);
                         }
-                        else {
-                            await supabase
-                                .from('calls')
-                                .update({
-                                status: call.lead_leg_id ? 'lead_dialing' : 'failed',
-                                ended_at: call.lead_leg_id ? null : now,
-                                wrapped_at: call.lead_leg_id ? null : now,
-                            })
-                                .eq('id', call.id);
-                            if (!call.lead_leg_id)
-                                await markLeadFailed(call.lead_id);
-                        }
-                        await releaseAgentForCall(call);
                     }
                     break;
                 }
-                if (clientState.leg_type === 'lead' && clientState.call_id) {
-                    const { data: call } = await supabase
-                        .from('calls')
-                        .select('id, lead_id, agent_id, group_id, status, answered_at')
-                        .eq('id', clientState.call_id)
-                        .single();
-                    if (call && call.status !== 'completed' && call.status !== 'voicemail') {
-                        const completed = call.status === 'bridged';
-                        if (call.answered_at || completed) {
-                            await supabase
-                                .from('calls')
-                                .update({ status: completed ? 'completed' : 'no_answer', ended_at: now, wrapped_at: completed ? null : now })
-                                .eq('id', call.id);
-                            if (call.lead_id && !completed) {
+                case 'call.gather.ended':
+                case 'call.dtmf.received': {
+                    if (clientState.action === 'ivr_response' && clientState.call_id) {
+                        const digit = getGatherDigit(callData);
+                        const now = new Date().toISOString();
+                        const { data: call } = await supabase
+                            .from('calls')
+                            .select('id, lead_id, agent_id, status')
+                            .eq('id', clientState.call_id)
+                            .single();
+                        if (!call) {
+                            await telnyxAction(callControlId, 'hangup');
+                            break;
+                        }
+                        if (digit === '1') {
+                            const agentDialing = await dialReadyAgentForLead(callControlId, call.id, call.lead_id);
+                            if (!agentDialing) {
+                                await markVoicemailAndHangup(callControlId, call.id, call.lead_id);
+                            }
+                            break;
+                        }
+                        if (digit === '2') {
+                            if (call.lead_id) {
                                 await supabase
                                     .from('leads')
-                                    .update({ status: 'no_answer', assigned_agent_id: null })
+                                    .update({ status: 'dnc', dnc_source: 'ivr_optout', dnc_at: now })
                                     .eq('id', call.lead_id);
+                            }
+                            await supabase
+                                .from('calls')
+                                .update({ disposition: 'Do Not Call', ended_at: now, wrapped_at: now })
+                                .eq('id', call.id);
+                            await telnyxAction(callControlId, 'hangup');
+                            break;
+                        }
+                        await markVoicemailAndHangup(callControlId, call.id, call.lead_id);
+                        if (call.agent_id) {
+                            await supabase
+                                .from('agent_sessions')
+                                .update({
+                                state: 'READY',
+                                active_call_id: null,
+                                updated_at: new Date().toISOString(),
+                            })
+                                .eq('agent_id', call.agent_id);
+                        }
+                    }
+                    break;
+                }
+                case 'call.machine.detection.ended': {
+                    if (getMachineDetectionResult(callData) === 'answering_machine' && clientState.call_id) {
+                        const { data: call } = await supabase
+                            .from('calls')
+                            .select('id, lead_id, status, agent_id, agent_leg_id')
+                            .eq('id', clientState.call_id)
+                            .single();
+                        if (call?.lead_id && !isTerminalCallStatus(call.status) && call.status !== 'bridged') {
+                            // ── AMD NO BLIND DROP: Check if READY agent available ──
+                            // If agent exists, bridge instead of blind drop
+                            if (call.agent_id && call.agent_leg_id && call.status === 'lead_dialing') {
+                                const bridged = await bridgeReservedAgentToLead(call, callControlId);
+                                if (bridged) {
+                                    console.log(`[AMD] Machine detected but agent available — bridging call ${call.id}`);
+                                    break;
+                                }
+                            }
+                            // No agent available or bridge failed — drop voicemail
+                            await dropVoicemail(callControlId, call.id, call.lead_id, 'auto_voicemail');
+                        }
+                    }
+                    break;
+                }
+                case 'call.playback.ended': {
+                    if (['auto_voicemail', 'ivr_voicemail', 'manual_voicemail'].includes(clientState.action ?? '') && clientState.call_id) {
+                        const now = new Date().toISOString();
+                        await telnyxAction(callControlId, 'hangup');
+                        await supabase
+                            .from('calls')
+                            .update({ ended_at: now, wrapped_at: now })
+                            .eq('id', clientState.call_id);
+                        if (clientState.action === 'auto_voicemail' || clientState.action === 'ivr_voicemail') {
+                            const { data: call } = await supabase
+                                .from('calls')
+                                .select('group_id, agent_id')
+                                .eq('id', clientState.call_id)
+                                .single();
+                            if (call) {
+                                await releaseAgentForCall(call);
+                            }
+                        }
+                    }
+                    break;
+                }
+                case 'call.recording.saved':
+                case 'call.recording.ended': {
+                    await saveInboundRecording(callData, clientState);
+                    break;
+                }
+                case 'call.hangup': {
+                    const now = new Date().toISOString();
+                    if (clientState.leg_type === 'agent' && clientState.agent_id) {
+                        const { data: calls } = await supabase
+                            .from('calls')
+                            .select('id, lead_id, agent_id, group_id, status, lead_leg_id, answered_at')
+                            .eq('agent_leg_id', callControlId)
+                            .in('status', ['created', 'agent_dialing', 'agent_answered', 'lead_dialing', 'bridged']);
+                        for (const call of calls ?? []) {
+                            if (call.status === 'bridged') {
+                                if (call.lead_leg_id)
+                                    await telnyxAction(call.lead_leg_id, 'hangup');
+                                await supabase
+                                    .from('calls')
+                                    .update({ status: 'completed', ended_at: now, wrapped_at: now })
+                                    .eq('id', call.id);
+                            }
+                            else {
+                                await supabase
+                                    .from('calls')
+                                    .update({
+                                    status: call.lead_leg_id ? 'lead_dialing' : 'failed',
+                                    ended_at: call.lead_leg_id ? null : now,
+                                    wrapped_at: call.lead_leg_id ? null : now,
+                                })
+                                    .eq('id', call.id);
+                                if (!call.lead_leg_id)
+                                    await markLeadFailed(call.lead_id);
                             }
                             await releaseAgentForCall(call);
                         }
+                        break;
                     }
+                    if (clientState.leg_type === 'lead' && clientState.call_id) {
+                        const { data: call } = await supabase
+                            .from('calls')
+                            .select('id, lead_id, agent_id, group_id, status, answered_at')
+                            .eq('id', clientState.call_id)
+                            .single();
+                        if (call && call.status !== 'completed' && call.status !== 'voicemail') {
+                            const completed = call.status === 'bridged';
+                            if (call.answered_at || completed) {
+                                await supabase
+                                    .from('calls')
+                                    .update({ status: completed ? 'completed' : 'no_answer', ended_at: now, wrapped_at: completed ? null : now })
+                                    .eq('id', call.id);
+                                if (call.lead_id && !completed) {
+                                    await supabase
+                                        .from('leads')
+                                        .update({ status: 'no_answer', assigned_agent_id: null })
+                                        .eq('id', call.lead_id);
+                                }
+                                await releaseAgentForCall(call);
+                            }
+                        }
+                        break;
+                    }
+                    if (clientState.action === 'inbound_bridge' && clientState.agent_id) {
+                        const { count: releaseCount } = await supabase
+                            .from('agent_sessions')
+                            .update({ state: 'READY', active_call_id: null, updated_at: now })
+                            .eq('agent_id', clientState.agent_id)
+                            .in('state', ['RESERVED', 'IN_CALL']);
+                        if (!releaseCount)
+                            console.warn(`[webhook] Agent ${clientState.agent_id} READY release rejected`);
+                        await supabase
+                            .from('calls')
+                            .update({ status: 'completed', ended_at: now, wrapped_at: now })
+                            .eq('agent_leg_id', callControlId)
+                            .eq('direction', 'inbound');
+                        break;
+                    }
+                    if (clientState.action === 'failover_to_chris')
+                        break;
                     break;
                 }
-                if (clientState.action === 'inbound_bridge' && clientState.agent_id) {
-                    await supabase
-                        .from('agent_sessions')
-                        .update({ state: 'READY', active_call_id: null, updated_at: now })
-                        .eq('agent_id', clientState.agent_id)
-                        .in('state', ['RESERVED', 'IN_CALL']);
-                    await supabase
-                        .from('calls')
-                        .update({ status: 'completed', ended_at: now, wrapped_at: now })
-                        .eq('agent_leg_id', callControlId)
-                        .eq('direction', 'inbound');
+                default:
                     break;
-                }
-                if (clientState.action === 'failover_to_chris')
-                    break;
-                break;
             }
-            default:
-                break;
-        }
+        }); // end setImmediate
         return reply.status(200).send({ ok: true });
     };
     app.post('/telnyx', handleTelnyxWebhook);
