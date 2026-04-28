@@ -11,11 +11,45 @@ function normalizePhone(raw) {
 export async function campaignRoutes(app) {
     // GET /campaigns — list all
     app.get('/', { onRequest: [app.authenticate] }, async (_req, reply) => {
-        const { data } = await supabase
+        const { data, error } = await supabase
             .from('campaigns')
             .select('id, name, status, caller_id, created_at')
             .order('created_at', { ascending: false });
-        return reply.send({ campaigns: data ?? [] });
+        if (error)
+            return reply.status(500).send({ error: error.message });
+        const today = new Date();
+        today.setUTCHours(0, 0, 0, 0);
+        const todayIso = today.toISOString();
+        const campaigns = [];
+        for (const campaign of data ?? []) {
+            const [{ count: leadCount }, { count: totalCallsToday }, { count: bridgedCallsToday }] = await Promise.all([
+                supabase
+                    .from('leads')
+                    .select('*', { count: 'exact', head: true })
+                    .eq('campaign_id', campaign.id),
+                supabase
+                    .from('calls')
+                    .select('*', { count: 'exact', head: true })
+                    .eq('campaign_id', campaign.id)
+                    .gte('started_at', todayIso),
+                supabase
+                    .from('calls')
+                    .select('*', { count: 'exact', head: true })
+                    .eq('campaign_id', campaign.id)
+                    .eq('status', 'bridged')
+                    .gte('started_at', todayIso),
+            ]);
+            const callsToday = totalCallsToday ?? 0;
+            const connectedToday = bridgedCallsToday ?? 0;
+            campaigns.push({
+                ...campaign,
+                lead_count: leadCount ?? 0,
+                leads_remaining: leadCount ?? 0,
+                calls_today: callsToday,
+                connect_rate: callsToday > 0 ? parseFloat(((connectedToday / callsToday) * 100).toFixed(1)) : 0,
+            });
+        }
+        return reply.send({ campaigns });
     });
     // GET /campaigns/:id/stats
     app.get('/:id/stats', { onRequest: [app.authenticate] }, async (req, reply) => {

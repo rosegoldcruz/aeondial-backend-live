@@ -145,6 +145,8 @@ export async function leadRoutes(app) {
                 zip: pick(row, ['zip', 'Zip', 'ZIP']) ?? null,
                 timezone: pick(row, ['timezone', 'Timezone']) ?? null,
                 timezone_source: pick(row, ['timezone_source']) ?? null,
+                consent_source: pick(row, ['consent_source']) || pick(row, ['source_list']) || 'IVT Crypto Master list - affiliated partner opt-in',
+                consent_date: new Date().toISOString(),
                 status: 'pending',
                 attempts: 0,
             });

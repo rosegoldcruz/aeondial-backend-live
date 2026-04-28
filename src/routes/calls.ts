@@ -5,6 +5,27 @@ import { hangupCall } from '../lib/telnyx.js';
 import Telnyx from 'telnyx';
 
 const telnyx = new (Telnyx as any)({ apiKey: process.env.TELNYX_API_KEY });
+const TELNYX_API = 'https://api.telnyx.com/v2';
+
+function encodeState(state: Record<string, unknown>) {
+  return Buffer.from(JSON.stringify(state)).toString('base64');
+}
+
+async function telnyxAction(callControlId: string, action: string, body: Record<string, unknown> = {}) {
+  const res = await fetch(`${TELNYX_API}/calls/${callControlId}/actions/${action}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.TELNYX_API_KEY}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as any)?.errors?.[0]?.detail ?? `Telnyx ${action} failed`);
+  }
+  return res;
+}
 
 function normalizePhone(raw: string): string {
   const digits = raw.replace(/\D/g, '');
@@ -96,6 +117,14 @@ export async function callRoutes(app: FastifyInstance) {
       })
       .eq('id', callId);
 
+    await supabase
+      .from('agent_sessions')
+      .update({
+        state: 'WRAP_UP',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('agent_id', agentId);
+
     // Update lead status
     let leadStatus = 'disposed';
     if (disposition === 'Do Not Call') leadStatus = 'dnc';
@@ -137,25 +166,14 @@ export async function callRoutes(app: FastifyInstance) {
       });
     }
 
-    // Return agent to READY or keep PAUSED based on session
-    const { data: session } = await supabase
+    await supabase
       .from('agent_sessions')
-      .select('state')
-      .eq('agent_id', agentId)
-      .single();
-
-    // If agent is in WRAP_UP, set back to READY
-    if (session?.state === 'WRAP_UP') {
-      await supabase
-        .from('agent_sessions')
-        .update({
-          state: 'READY',
-          active_call_id: null,
-          last_ready_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq('agent_id', agentId);
-    }
+      .update({
+        state: 'READY',
+        active_call_id: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('agent_id', agentId);
 
     await supabase.from('audit_events').insert({
       entity_type: 'call',
@@ -190,6 +208,46 @@ export async function callRoutes(app: FastifyInstance) {
     await Promise.all(hangups);
 
     return reply.send({ success: true });
+  });
+
+  // POST /calls/:id/voicemail-drop — agent manually drops voicemail audio to lead leg
+  app.post('/:id/voicemail-drop', { onRequest: [app.authenticate] } as any, async (req: any, reply) => {
+    const { id } = req.params as { id: string };
+    const agentId = req.user.agentId as string;
+
+    const { data: call } = await supabase
+      .from('calls')
+      .select('id, lead_leg_id, lead_id, status')
+      .eq('id', id)
+      .eq('agent_id', agentId)
+      .single();
+
+    if (!call || !call.lead_leg_id) {
+      return reply.status(404).send({ error: 'Call not found' });
+    }
+
+    await telnyxAction(call.lead_leg_id, 'playback_start', {
+      audio_url: 'https://api.aeondial.com/static/VoicemailDrop.mp3',
+      loop: 'once',
+      client_state: encodeState({ call_id: id, action: 'manual_voicemail' }),
+    });
+
+    const now = new Date().toISOString();
+    await supabase
+      .from('calls')
+      .update({ voicemail_dropped: true, voicemail_at: now })
+      .eq('id', id);
+
+    await supabase
+      .from('leads')
+      .update({ last_voicemail_at: now })
+      .eq('id', call.lead_id);
+
+    if (call.lead_id) {
+      await supabase.rpc('increment', { row_id: call.lead_id, col: 'voicemail_drop_count' });
+    }
+
+    return reply.send({ ok: true });
   });
 
   // POST /calls/manual-dial — agent initiates outbound call to a specific number

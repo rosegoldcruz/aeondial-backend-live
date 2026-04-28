@@ -1,10 +1,8 @@
 import "dotenv/config";
 import Fastify from 'fastify';
-import { createReadStream } from 'fs';
-import { stat } from 'fs/promises';
-import { join } from 'path';
 import cors from '@fastify/cors';
 import jwt from '@fastify/jwt';
+import fastifyStatic from '@fastify/static';
 import { authRoutes } from './routes/auth.js';
 import { sessionRoutes } from './routes/session.js';
 import { callRoutes } from './routes/calls.js';
@@ -31,6 +29,12 @@ await app.register(jwt, {
   secret: process.env.JWT_SECRET ?? 'changeme',
 });
 
+await app.register(fastifyStatic, {
+  root: '/var/www/aeondial',
+  prefix: '/static/',
+  decorateReply: false,
+});
+
 // ── Auth decorator ────────────────────────────────────────
 app.decorate('authenticate', async (req: any, reply: any) => {
   try {
@@ -49,27 +53,7 @@ await app.register(campaignStatsRoute,  { prefix: '/campaigns' });
 await app.register(agentRoutes,         { prefix: '/agents' });
 await app.register(leadRoutes,          { prefix: '/leads' });
 await app.register(listRoutes,          { prefix: '/lists' });
-await app.register(telnyxWebhookRoutes, { prefix: '/webhooks' });
-
-const STATIC_DIR = join(process.cwd(), 'public', 'static');
-
-app.get('/static/:filename', async (req: any, reply) => {
-  const filename = String(req.params.filename ?? '');
-  if (filename !== 'Voicemailmessage.wav') {
-    return reply.status(404).send({ error: 'Not found' });
-  }
-
-  const filePath = join(STATIC_DIR, filename);
-  const fileStat = await stat(filePath).catch(() => null);
-  if (!fileStat) {
-    return reply.status(404).send({ error: 'Not found' });
-  }
-
-  reply.header('Content-Type', 'audio/wav');
-  reply.header('Content-Length', fileStat.size);
-  reply.header('Cache-Control', 'public, max-age=86400');
-  return reply.send(createReadStream(filePath));
-});
+await app.register(telnyxWebhookRoutes);
 
 // ── Health ────────────────────────────────────────────────
 app.get('/health', async () => ({ status: 'ok', ts: new Date().toISOString() }));

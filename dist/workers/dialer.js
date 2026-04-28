@@ -3,6 +3,7 @@ import { Worker, Queue } from 'bullmq';
 import { randomUUID } from 'crypto';
 import { supabase } from '../lib/supabase.js';
 import { redis } from '../lib/redis.js';
+import { checkAndPauseCampaignIfNeeded } from '../lib/abandonmentMonitor.js';
 import Telnyx from 'telnyx';
 const telnyx = new Telnyx({ apiKey: process.env.TELNYX_API_KEY });
 const DIAL_QUEUE = 'dial-queue';
@@ -118,7 +119,7 @@ function isTCPACallable(phone, timezone) {
     try {
         const now = new Date();
         const localHour = parseInt(now.toLocaleString('en-US', { timeZone: tz, hour: 'numeric', hour12: false }));
-        return localHour >= 9 && localHour < 21; // 9am–9pm
+        return localHour >= 8 && localHour < 21; // 8am–9pm
     }
     catch {
         return true; // if tz is invalid, allow the call
@@ -132,7 +133,8 @@ const TEST_PHONE_NUMBERS = (process.env.TEST_PHONE_NUMBERS ?? '')
     .map((phone) => phone.trim())
     .filter(Boolean);
 const POST_RELEASE_COOLDOWN_MS = 2000; // delay before agent becomes eligible again
-const SOLO_AGENT_BATCH_SIZE = 1;
+const SOLO_AGENT_BATCH_SIZE = 2;
+let abandonmentMonitorTick = 0;
 function isTestPhoneNumber(phone) {
     return TEST_PHONE_NUMBERS.includes(phone) || (!!TEST_PHONE_NUMBER && phone === TEST_PHONE_NUMBER);
 }
@@ -165,11 +167,26 @@ async function tick() {
             .is('active_call_id', null);
         if (!readySessions || readySessions.length === 0)
             return;
-        // ── Dynamic batch size ──────────────────────────────────
-        // 1 agent online  → 1:1 progressive (don't over-dial, abandonment risk)
-        // 2+ agents online → 3:1 predictive (enough coverage to handle pickups)
+        abandonmentMonitorTick += 1;
+        if (abandonmentMonitorTick % 10 === 0) {
+            const { data: campaigns, error: campaignError } = await supabase
+                .from('campaigns')
+                .select('id')
+                .eq('status', 'active');
+            if (campaignError) {
+                console.error('[COMPLIANCE] Failed to fetch campaigns for abandonment check:', campaignError.message);
+            }
+            for (const campaign of campaigns ?? []) {
+                const paused = await checkAndPauseCampaignIfNeeded(supabase, campaign.id);
+                if (paused)
+                    return;
+            }
+        }
         const readyCount = readySessions.length;
-        const batchSize = readyCount >= 2 ? 3 : 1;
+        // Batch size rules:
+        // 1 agent online  → 2:1 (enough coverage, not over-dialing solo)
+        // 2+ agents online → 3:1 (full predictive, enough agents to handle pickups)
+        const batchSize = readyCount >= 2 ? 3 : 2;
         console.log(`[TICKER] ${readyCount} agent(s) ready — batch size: ${batchSize}`);
         for (const session of readySessions) {
             const lockKey = `dialer:agent:${session.agent_id}:locked`;
@@ -221,13 +238,32 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
         .from('agent_sessions')
         .update({ state: 'RESERVED', updated_at: new Date().toISOString() })
         .eq('agent_id', agentId);
-    // 4. Pick next lead from active campaigns
+    // 4. Pick next lead from active campaign and enforce attempts cap
+    const { data: campaign } = await supabase
+        .from('campaigns')
+        .select('id, max_attempts')
+        .eq('status', 'active')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+    if (!campaign?.id) {
+        console.log(`[WORKER] No active campaign found — releasing agent ${agentId}`);
+        await supabase
+            .from('agent_sessions')
+            .update({ state: 'READY', updated_at: new Date().toISOString() })
+            .eq('agent_id', agentId);
+        await releaseLock(agentId);
+        return;
+    }
+    const maxAttempts = Number(campaign.max_attempts ?? 3);
     let leadQuery = supabase
         .from('leads')
         .select('id, phone, first_name, last_name, campaign_id, attempts, timezone')
+        .eq('campaign_id', campaign.id)
         .eq('status', 'pending')
         .is('assigned_agent_id', null)
         .or('callback_at.is.null,callback_at.lte.' + new Date().toISOString())
+        .lt('attempts', maxAttempts)
         .neq('status', 'dnc');
     // TEST MODE: only dial the test number
     if (DIALER_MODE !== 'production') {
@@ -257,8 +293,10 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
         const { data: testCandidates } = await supabase
             .from('leads')
             .select('id, phone, first_name, last_name, campaign_id, attempts, timezone')
+            .eq('campaign_id', campaign.id)
             .eq('status', 'pending')
             .is('assigned_agent_id', null)
+            .lt('attempts', maxAttempts)
             .in('phone', TEST_PHONE_NUMBERS);
         const existingIds = new Set(candidateLeads.map((l) => l.id));
         for (const lead of testCandidates ?? []) {
@@ -272,10 +310,12 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
         if (isTestPhoneNumber(lead.phone)) {
             return true;
         }
-        return isTCPACallable(lead.phone, lead.timezone);
+        if (!isTCPACallable(lead.phone, lead.timezone))
+            return false;
+        return true;
     })
-        .slice(0, job.data.batchSize ?? 1);
-    if (leads.length < (job.data.batchSize ?? 1)) {
+        .slice(0, job.data.batchSize ?? 2);
+    if (leads.length < (job.data.batchSize ?? 2)) {
         console.log(`[WORKER] No leads available — releasing agent ${agentId}`);
         await supabase
             .from('agent_sessions')

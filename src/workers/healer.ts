@@ -27,14 +27,14 @@ async function heal() {
 
       if (call.lead_id) {
         await supabase.from('leads')
-          .update({ status: 'failed', assigned_agent_id: null, last_called_at: now.toISOString() })
+          .update({ status: 'pending', assigned_agent_id: null, last_called_at: now.toISOString() })
           .eq('id', call.lead_id)
           .in('status', ['reserved','answered']);
       }
 
       if (call.agent_id) {
         await supabase.from('agent_sessions')
-          .update({ state: 'REGISTERED', active_call_id: null, updated_at: now.toISOString() })
+          .update({ state: 'READY', active_call_id: null, updated_at: now.toISOString() })
           .eq('agent_id', call.agent_id)
           .in('state', ['RESERVED','IN_CALL','WRAP_UP']);
       }
@@ -54,7 +54,7 @@ async function heal() {
     console.log(`[HEALER] Found ${stuckAgents.length} stuck RESERVED agent(s) — releasing`);
     for (const a of stuckAgents) {
       await supabase.from('agent_sessions')
-        .update({ state: 'REGISTERED', active_call_id: null, updated_at: now.toISOString() })
+        .update({ state: 'READY', active_call_id: null, updated_at: now.toISOString() })
         .eq('agent_id', a.agent_id);
       console.log(`[HEALER] Released stuck agent ${a.agent_id}`);
     }
