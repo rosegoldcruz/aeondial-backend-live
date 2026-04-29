@@ -381,6 +381,7 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
         await supabase
             .from('calls')
             .update({
+            call_control_id: agentCallControlId,
             agent_leg_id: agentCallControlId,
             status: 'agent_dialing',
         })
