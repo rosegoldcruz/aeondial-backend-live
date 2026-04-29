@@ -149,7 +149,7 @@ function buildAgentDialTarget(sipUsername) {
     return `sip:${normalizedUsername}@${fallbackDomain}`;
 }
 // ── Queues ────────────────────────────────────────────────
-const dialQueue = new Queue(DIAL_QUEUE, {
+export const dialQueue = new Queue(DIAL_QUEUE, {
     connection: redis,
     defaultJobOptions: {
         attempts: 1,

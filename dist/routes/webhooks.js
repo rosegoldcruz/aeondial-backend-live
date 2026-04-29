@@ -1,5 +1,6 @@
 import { supabase } from '../lib/supabase.js';
 import { redis } from '../lib/redis.js';
+import { dialQueue } from '../workers/dialer.js';
 const POST_RELEASE_COOLDOWN_MS = 2000;
 async function setAgentCooldown(agentId, ms = POST_RELEASE_COOLDOWN_MS) {
     await redis.set(`dialer:agent:${agentId}:locked`, '1', 'PX', ms);
@@ -290,6 +291,24 @@ async function maybeReleaseBatchAgent(supabaseClient, groupId, agentId) {
             .from('agent_sessions')
             .update({ state: 'READY', active_call_id: null, updated_at: new Date().toISOString() })
             .eq('agent_id', agentId);
+        // Immediately re-queue next batch — don't wait for tick
+        try {
+            const { data: freshSession } = await supabaseClient.from('agent_sessions')
+                .select('id')
+                .eq('agent_id', agentId)
+                .single();
+            if (freshSession) {
+                await dialQueue.add('dial-next', {
+                    agentId,
+                    sessionId: freshSession.id,
+                    batchSize: 2
+                }, { priority: 1, jobId: `immediate-${agentId}-${Date.now()}` });
+                console.log(`[BATCH] Immediately re-queued dial for agent ${agentId}`);
+            }
+        }
+        catch (requeueErr) {
+            console.error(`[BATCH] Failed to re-queue for agent ${agentId}:`, requeueErr);
+        }
     }
     catch (err) {
         console.error(`[BATCH] maybeReleaseBatchAgent error for agent ${agentId}:`, err);
@@ -299,6 +318,24 @@ async function maybeReleaseBatchAgent(supabaseClient, groupId, agentId) {
                 .from('agent_sessions')
                 .update({ state: 'READY', active_call_id: null, updated_at: new Date().toISOString() })
                 .eq('agent_id', agentId);
+            // Immediately re-queue next batch — don't wait for tick
+            try {
+                const { data: freshSession } = await supabaseClient.from('agent_sessions')
+                    .select('id')
+                    .eq('agent_id', agentId)
+                    .single();
+                if (freshSession) {
+                    await dialQueue.add('dial-next', {
+                        agentId,
+                        sessionId: freshSession.id,
+                        batchSize: 2
+                    }, { priority: 1, jobId: `immediate-${agentId}-${Date.now()}` });
+                    console.log(`[BATCH] Immediately re-queued dial for agent ${agentId}`);
+                }
+            }
+            catch (requeueErr) {
+                console.error(`[BATCH] Failed to re-queue for agent ${agentId}:`, requeueErr);
+            }
         }
         catch (fallbackErr) {
             console.error(`[BATCH] Fallback release also failed for agent ${agentId}:`, fallbackErr);
@@ -312,10 +349,29 @@ async function releaseAgentForCall(call) {
         await maybeReleaseBatchAgent(supabase, call.group_id, call.agent_id);
         return;
     }
+    const agentId = call.agent_id;
     await supabase
         .from('agent_sessions')
         .update({ state: 'READY', active_call_id: null, updated_at: new Date().toISOString() })
-        .eq('agent_id', call.agent_id);
+        .eq('agent_id', agentId);
+    // Immediately re-queue next batch — don't wait for tick
+    try {
+        const { data: freshSession } = await supabase.from('agent_sessions')
+            .select('id')
+            .eq('agent_id', agentId)
+            .single();
+        if (freshSession) {
+            await dialQueue.add('dial-next', {
+                agentId,
+                sessionId: freshSession.id,
+                batchSize: 2
+            }, { priority: 1, jobId: `immediate-${agentId}-${Date.now()}` });
+            console.log(`[BATCH] Immediately re-queued dial for agent ${agentId}`);
+        }
+    }
+    catch (requeueErr) {
+        console.error(`[BATCH] Failed to re-queue for agent ${agentId}:`, requeueErr);
+    }
 }
 export async function telnyxWebhookRoutes(app) {
     const handleTelnyxWebhook = async (req, reply) => {
@@ -440,11 +496,11 @@ export async function telnyxWebhookRoutes(app) {
                             .in('lead_id', leadIds)
                             .eq('agent_id', clientState.agent_id)
                             .in('status', ['agent_answered']);
-                        for (const call of calls ?? []) {
+                        await Promise.all((calls ?? []).map(async (call) => {
                             const phone = call.leads?.phone;
                             if (!phone) {
                                 await markLeadFailed(call.lead_id);
-                                continue;
+                                return;
                             }
                             const leadDial = await telnyxDial({
                                 connection_id: process.env.TELNYX_CONNECTION_ID,
@@ -472,7 +528,7 @@ export async function telnyxWebhookRoutes(app) {
                                     .eq('id', call.id);
                                 await markLeadFailed(call.lead_id);
                             }
-                        }
+                        }));
                         break;
                     }
                     if (clientState.leg_type === 'lead' && clientState.call_id) {
@@ -534,6 +590,7 @@ export async function telnyxWebhookRoutes(app) {
                         }
                         await markVoicemailAndHangup(callControlId, call.id, call.lead_id);
                         if (call.agent_id) {
+                            const agentId = call.agent_id;
                             await supabase
                                 .from('agent_sessions')
                                 .update({
@@ -541,7 +598,25 @@ export async function telnyxWebhookRoutes(app) {
                                 active_call_id: null,
                                 updated_at: new Date().toISOString(),
                             })
-                                .eq('agent_id', call.agent_id);
+                                .eq('agent_id', agentId);
+                            // Immediately re-queue next batch — don't wait for tick
+                            try {
+                                const { data: freshSession } = await supabase.from('agent_sessions')
+                                    .select('id')
+                                    .eq('agent_id', agentId)
+                                    .single();
+                                if (freshSession) {
+                                    await dialQueue.add('dial-next', {
+                                        agentId,
+                                        sessionId: freshSession.id,
+                                        batchSize: 2
+                                    }, { priority: 1, jobId: `immediate-${agentId}-${Date.now()}` });
+                                    console.log(`[BATCH] Immediately re-queued dial for agent ${agentId}`);
+                                }
+                            }
+                            catch (requeueErr) {
+                                console.error(`[BATCH] Failed to re-queue for agent ${agentId}:`, requeueErr);
+                            }
                         }
                     }
                     break;
@@ -672,6 +747,25 @@ export async function telnyxWebhookRoutes(app) {
                             .in('state', ['RESERVED', 'IN_CALL']);
                         if (!releaseCount)
                             console.warn(`[webhook] Agent ${clientState.agent_id} READY release rejected`);
+                        // Immediately re-queue next batch — don't wait for tick
+                        const agentIdInbound = clientState.agent_id;
+                        try {
+                            const { data: freshSession } = await supabase.from('agent_sessions')
+                                .select('id')
+                                .eq('agent_id', agentIdInbound)
+                                .single();
+                            if (freshSession) {
+                                await dialQueue.add('dial-next', {
+                                    agentId: agentIdInbound,
+                                    sessionId: freshSession.id,
+                                    batchSize: 2
+                                }, { priority: 1, jobId: `immediate-${agentIdInbound}-${Date.now()}` });
+                                console.log(`[BATCH] Immediately re-queued dial for agent ${agentIdInbound}`);
+                            }
+                        }
+                        catch (requeueErr) {
+                            console.error(`[BATCH] Failed to re-queue for agent ${agentIdInbound}:`, requeueErr);
+                        }
                         await supabase
                             .from('calls')
                             .update({ status: 'completed', ended_at: now, wrapped_at: now })
