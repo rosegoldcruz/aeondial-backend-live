@@ -140,11 +140,11 @@ function isTestPhoneNumber(phone) {
     return TEST_PHONE_NUMBERS.includes(phone) || (!!TEST_PHONE_NUMBER && phone === TEST_PHONE_NUMBER);
 }
 function buildAgentDialTarget(sipUsername) {
-    // Agents register under the call control application's SIP subdomain.
-    // For AEON DIAL the subdomain is 'aeondial', so endpoints live at
-    // sip:user@aeondial.sip.telnyx.com. Using bare sip.telnyx.com returns
-    // 403/user_busy because Telnyx can't find the registration.
-    const fallbackDomain = process.env.AGENT_LEG_SIP_DOMAIN || 'aeondial.sip.telnyx.com';
+    // Each agent has their own Telnyx credential connection (anchorsite: Chicago, IL).
+    // Agents register via WebRTC SDK using (username, password) from the credential
+    // connection and dial via sip:${username}@sip.telnyx.com (AGENT_LEG_SIP_DOMAIN).
+    // Both the credential connection and call control app must use the same anchorsite.
+    const fallbackDomain = process.env.AGENT_LEG_SIP_DOMAIN || 'sip.telnyx.com';
     const normalizedUsername = sipUsername.trim().replace(/^sip:/, '').split('@')[0];
     return `sip:${normalizedUsername}@${fallbackDomain}`;
 }
