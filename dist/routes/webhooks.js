@@ -476,32 +476,142 @@ export async function telnyxWebhookRoutes(app) {
                                 .eq('id', clientState.call_id);
                             break;
                         }
-                        const leadIds = clientState.lead_ids ?? [];
-                        const { count: reservedCount } = await supabase
+                        let leadIds = Array.isArray(clientState.lead_ids)
+                            ? clientState.lead_ids.filter(Boolean)
+                            : [];
+                        console.log('[AGENT_ANSWERED] incoming', {
+                            callControlId,
+                            agent_id: clientState.agent_id,
+                            call_id: clientState.call_id,
+                            leadIdsFromClientState: leadIds,
+                        });
+                        const { data: reservedRows, error: reservedErr } = await supabase
                             .from('agent_sessions')
-                            .update({ state: 'RESERVED', active_call_id: clientState.call_id, updated_at: now })
+                            .update({
+                            state: 'RESERVED',
+                            active_call_id: clientState.call_id,
+                            updated_at: now,
+                        })
                             .eq('agent_id', clientState.agent_id)
-                            .in('state', ['REGISTERED', 'READY']);
-                        if (!reservedCount)
-                            console.warn(`[webhook] Agent ${clientState.agent_id} state RESERVED rejected`);
-                        await supabase
+                            .in('state', ['REGISTERED', 'READY', 'RESERVED'])
+                            .select('id, agent_id, state, active_call_id');
+                        if (reservedErr) {
+                            console.error('[AGENT_ANSWERED] RESERVED update error:', reservedErr);
+                        }
+                        if (!reservedRows?.length) {
+                            console.warn('[AGENT_ANSWERED] RESERVED update matched zero rows', {
+                                agent_id: clientState.agent_id,
+                                call_id: clientState.call_id,
+                            });
+                        }
+                        if (leadIds.length === 0) {
+                            const { data: primaryCall, error: primaryErr } = await supabase
+                                .from('calls')
+                                .select('id, lead_id, group_id, agent_id, status')
+                                .eq('id', clientState.call_id)
+                                .single();
+                            if (primaryErr) {
+                                console.error('[AGENT_ANSWERED] primary call lookup failed:', primaryErr);
+                            }
+                            if (primaryCall?.group_id) {
+                                const { data: siblingCalls, error: siblingErr } = await supabase
+                                    .from('calls')
+                                    .select('id, lead_id, status, agent_id, group_id')
+                                    .eq('group_id', primaryCall.group_id)
+                                    .eq('agent_id', clientState.agent_id)
+                                    .in('status', ['created', 'agent_dialing', 'agent_answered']);
+                                if (siblingErr) {
+                                    console.error('[AGENT_ANSWERED] sibling call lookup failed:', siblingErr);
+                                }
+                                leadIds = (siblingCalls ?? []).map((c) => c.lead_id).filter(Boolean);
+                                console.log('[AGENT_ANSWERED] recovered leadIds from group', {
+                                    group_id: primaryCall.group_id,
+                                    count: leadIds.length,
+                                    leadIds,
+                                });
+                            }
+                            else if (primaryCall?.lead_id) {
+                                leadIds = [primaryCall.lead_id];
+                            }
+                        }
+                        if (leadIds.length === 0) {
+                            console.error('[LEAD_DIAL_BLOCKED] no leadIds after clientState + DB recovery', {
+                                callControlId,
+                                clientState,
+                            });
+                            break;
+                        }
+                        const { data: answeredCalls, error: answeredErr } = await supabase
                             .from('calls')
-                            .update({ status: 'agent_answered', agent_leg_id: callControlId })
+                            .update({
+                            status: 'agent_answered',
+                            agent_leg_id: callControlId,
+                        })
                             .in('lead_id', leadIds)
                             .eq('agent_id', clientState.agent_id)
-                            .in('status', ['created', 'agent_dialing']);
-                        const { data: calls } = await supabase
+                            .in('status', ['created', 'agent_dialing', 'agent_answered'])
+                            .select('id, lead_id, status, agent_id, group_id');
+                        if (answeredErr) {
+                            console.error('[AGENT_ANSWERED] failed to mark calls agent_answered:', answeredErr);
+                        }
+                        console.log('[AGENT_ANSWERED] matched calls', {
+                            count: answeredCalls?.length ?? 0,
+                            leadIds,
+                            calls: answeredCalls,
+                        });
+                        if (!answeredCalls?.length) {
+                            console.error('[LEAD_DIAL_BLOCKED] no calls matched agent_answered update', {
+                                agent_id: clientState.agent_id,
+                                leadIds,
+                                callControlId,
+                            });
+                            break;
+                        }
+                        const answeredCallIds = answeredCalls.map((c) => c.id).filter(Boolean);
+                        const { data: calls, error: callsErr } = await supabase
                             .from('calls')
-                            .select('id, lead_id, leads(phone)')
-                            .in('lead_id', leadIds)
-                            .eq('agent_id', clientState.agent_id)
-                            .in('status', ['agent_answered']);
+                            .select('id, lead_id, agent_id, status, group_id, leads(phone)')
+                            .in('id', answeredCallIds);
+                        if (callsErr) {
+                            console.error('[AGENT_ANSWERED] failed to select calls for lead dialing:', callsErr);
+                        }
+                        console.log('[AGENT_ANSWERED] calls selected for lead dialing', {
+                            count: calls?.length ?? 0,
+                            calls: (calls ?? []).map((c) => ({
+                                id: c.id,
+                                lead_id: c.lead_id,
+                                status: c.status,
+                                phone: Array.isArray(c.leads) ? c.leads[0]?.phone : c.leads?.phone,
+                            })),
+                        });
+                        if (!calls?.length) {
+                            console.error('[LEAD_DIAL_BLOCKED] zero calls selected for lead dialing', {
+                                answeredCallIds,
+                            });
+                            break;
+                        }
                         await Promise.all((calls ?? []).map(async (call) => {
-                            const phone = call.leads?.phone;
+                            const leadsRelation = call.leads;
+                            const phone = Array.isArray(leadsRelation)
+                                ? leadsRelation[0]?.phone
+                                : leadsRelation?.phone;
                             if (!phone) {
+                                console.error('[LEAD_DIAL_BLOCKED] missing lead phone', {
+                                    call_id: call.id,
+                                    lead_id: call.lead_id,
+                                    leadsRelation,
+                                });
                                 await markLeadFailed(call.lead_id);
                                 return;
                             }
+                            console.log('[LEAD_DIAL_ATTEMPT]', {
+                                call_id: call.id,
+                                lead_id: call.lead_id,
+                                to: phone,
+                                from: process.env.TELNYX_OUTBOUND_NUMBER,
+                                hasConnectionId: !!process.env.TELNYX_CONNECTION_ID,
+                                webhook_url: process.env.TELNYX_WEBHOOK_URL,
+                            });
                             const leadDial = await telnyxDial({
                                 connection_id: process.env.TELNYX_CONNECTION_ID,
                                 to: phone,
@@ -515,16 +625,43 @@ export async function telnyxWebhookRoutes(app) {
                                 }),
                             });
                             const leadLegId = leadDial.data?.call_control_id ?? leadDial.data?.callControlId;
+                            console.log('[LEAD_DIAL_RESULT]', {
+                                call_id: call.id,
+                                ok: leadDial.ok,
+                                leadLegId,
+                                data: leadDial.data,
+                            });
                             if (leadDial.ok && leadLegId) {
-                                await supabase
+                                const { data: leadLegRows, error: leadLegErr } = await supabase
                                     .from('calls')
-                                    .update({ status: 'lead_dialing', lead_leg_id: leadLegId })
-                                    .eq('id', call.id);
+                                    .update({
+                                    status: 'lead_dialing',
+                                    lead_leg_id: leadLegId,
+                                })
+                                    .eq('id', call.id)
+                                    .select('id, status, lead_leg_id');
+                                if (leadLegErr) {
+                                    console.error('[LEAD_DIAL_RESULT] failed to persist lead_leg_id:', leadLegErr);
+                                }
+                                console.log('[LEAD_DIAL_RESULT] persisted lead_leg_id', {
+                                    call_id: call.id,
+                                    leadLegId,
+                                    rows: leadLegRows,
+                                });
                             }
                             else {
+                                console.error('[LEAD_DIAL_FAILED]', {
+                                    call_id: call.id,
+                                    lead_id: call.lead_id,
+                                    leadDial,
+                                });
                                 await supabase
                                     .from('calls')
-                                    .update({ status: 'failed', ended_at: new Date().toISOString(), wrapped_at: new Date().toISOString() })
+                                    .update({
+                                    status: 'failed',
+                                    ended_at: new Date().toISOString(),
+                                    wrapped_at: new Date().toISOString(),
+                                })
                                     .eq('id', call.id);
                                 await markLeadFailed(call.lead_id);
                             }
