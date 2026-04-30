@@ -1,6 +1,6 @@
 import { supabase } from '../lib/supabase.js';
 import { redis } from '../lib/redis.js';
-import { dialQueue } from '../workers/dialer.js';
+import { dialQueue } from '../lib/dialQueue.js';
 const POST_RELEASE_COOLDOWN_MS = 2000;
 async function setAgentCooldown(agentId, ms = POST_RELEASE_COOLDOWN_MS) {
     await redis.set(`dialer:agent:${agentId}:locked`, '1', 'PX', ms);

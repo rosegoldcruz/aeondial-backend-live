@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { supabase } from '../lib/supabase.js'
 import { redis } from '../lib/redis.js'
-import { dialQueue } from '../workers/dialer.js'
+import { dialQueue } from '../lib/dialQueue.js'
 
 const POST_RELEASE_COOLDOWN_MS = 2000
 

@@ -1,8 +1,9 @@
 import 'dotenv/config';
-import { Worker, Queue } from 'bullmq';
+import { Worker } from 'bullmq';
 import { randomUUID } from 'crypto';
 import { supabase } from '../lib/supabase.js';
 import { redis } from '../lib/redis.js';
+import { dialQueue } from '../lib/dialQueue.js';
 import { checkAndPauseCampaignIfNeeded } from '../lib/abandonmentMonitor.js';
 import Telnyx from 'telnyx';
 const telnyxApiKey = (process.env.TELNYX_API_KEY ?? '').trim();
@@ -148,15 +149,6 @@ function buildAgentDialTarget(sipUsername) {
     const normalizedUsername = sipUsername.trim().replace(/^sip:/, '').split('@')[0];
     return `sip:${normalizedUsername}@${fallbackDomain}`;
 }
-// ── Queues ────────────────────────────────────────────────
-export const dialQueue = new Queue(DIAL_QUEUE, {
-    connection: redis,
-    defaultJobOptions: {
-        attempts: 1,
-        removeOnComplete: 100,
-        removeOnFail: 200,
-    },
-});
 // ── Ticker: find READY agents and queue dial jobs ─────────
 async function tick() {
     try {
