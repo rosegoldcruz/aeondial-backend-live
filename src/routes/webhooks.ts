@@ -1,13 +1,15 @@
 import type { FastifyInstance } from 'fastify'
 import { supabase } from '../lib/supabase.js'
 import { redis } from '../lib/redis.js'
-import { dialQueue } from '../lib/dialQueue.js'
 
 const POST_RELEASE_COOLDOWN_MS = 2000
-const TEST_BATCH_SIZE = 3
 
 async function setAgentCooldown(agentId: string, ms = POST_RELEASE_COOLDOWN_MS) {
   await redis.set(`dialer:agent:${agentId}:locked`, '1', 'PX', ms)
+}
+
+async function releaseAgentBatchLock(agentId: string) {
+  await redis.del(`dialer:agent:${agentId}:locked`)
 }
 
 const TELNYX_API = 'https://api.telnyx.com/v2'
@@ -196,6 +198,20 @@ async function bridgeReservedAgentToLead(call: any, leadCallControlId: string) {
   if (!call.agent_id || !call.agent_leg_id || isTerminalCallStatus(call.status)) return false
 
   const now = new Date().toISOString()
+  const bridgeLockKey = call.group_id ? `dialer:bridge:${call.group_id}` : `dialer:bridge:${call.id}`
+  const bridgeClaimed = await redis.set(bridgeLockKey, call.id, 'EX', 120, 'NX')
+
+  if (!bridgeClaimed) {
+    console.log('[BRIDGE_ATTEMPT]', {
+      call_id: call.id,
+      lead_id: call.lead_id,
+      agent_id: call.agent_id,
+      group_id: call.group_id,
+      lead_call_control_id: leadCallControlId,
+      skipped: 'bridge_lock_held',
+    })
+    return false
+  }
 
   if (call.group_id) {
     const { data: alreadyBridged } = await supabase
@@ -212,9 +228,18 @@ async function bridgeReservedAgentToLead(call: any, leadCallControlId: string) {
         lead_id: call.lead_id,
         bridged_sibling: alreadyBridged[0],
       })
+      await redis.del(bridgeLockKey)
       return false
     }
   }
+
+  console.log('[BRIDGE_ATTEMPT]', {
+    agent_call_control_id: call.agent_leg_id,
+    lead_call_control_id: leadCallControlId,
+    agent_id: call.agent_id,
+    lead_id: call.lead_id,
+    group_id: call.group_id,
+  })
 
   const { data: claimedCall, error: claimCallError } = await supabase
     .from('calls')
@@ -230,6 +255,7 @@ async function bridgeReservedAgentToLead(call: any, leadCallControlId: string) {
       lead_id: call.lead_id,
       error: claimCallError,
     })
+    await redis.del(bridgeLockKey)
     return false
   }
 
@@ -237,7 +263,7 @@ async function bridgeReservedAgentToLead(call: any, leadCallControlId: string) {
     .from('agent_sessions')
     .update({ state: 'IN_CALL', active_call_id: call.id, updated_at: now })
     .eq('agent_id', claimedCall.agent_id)
-    .eq('state', 'RESERVED')
+    .in('state', ['RESERVED', 'IN_CALL'])
     .select('agent_id, state, active_call_id')
     .single()
 
@@ -248,6 +274,7 @@ async function bridgeReservedAgentToLead(call: any, leadCallControlId: string) {
       agent_id: claimedCall.agent_id,
       error: sessionClaimError,
     })
+    await redis.del(bridgeLockKey)
     return false
   }
 
@@ -259,6 +286,7 @@ async function bridgeReservedAgentToLead(call: any, leadCallControlId: string) {
       .eq('agent_id', claimedCall.agent_id)
       .eq('state', 'IN_CALL')
       .eq('active_call_id', claimedCall.id)
+    await redis.del(bridgeLockKey)
     return false
   }
 
@@ -266,6 +294,30 @@ async function bridgeReservedAgentToLead(call: any, leadCallControlId: string) {
     .from('calls')
     .update({ status: 'bridged', lead_leg_id: leadCallControlId, answered_at: now, bridged_at: now })
     .eq('id', claimedCall.id)
+
+  if (claimedCall.group_id) {
+    const { data: siblingCalls } = await supabase
+      .from('calls')
+      .select('id, lead_id, lead_leg_id')
+      .eq('group_id', claimedCall.group_id)
+      .neq('id', claimedCall.id)
+      .in('status', ['created', 'agent_answered', 'lead_dialing', 'lead_answered'])
+
+    for (const sibling of siblingCalls ?? []) {
+      if (sibling.lead_leg_id) await telnyxAction(sibling.lead_leg_id, 'hangup')
+      await supabase
+        .from('calls')
+        .update({ status: 'aborted', ended_at: now, wrapped_at: now })
+        .eq('id', sibling.id)
+
+      if (sibling.lead_id) {
+        await supabase
+          .from('leads')
+          .update({ status: 'no_answer', assigned_agent_id: null })
+          .eq('id', sibling.lead_id)
+      }
+    }
+  }
 
   if (claimedCall.lead_id) {
     await supabase
@@ -278,6 +330,7 @@ async function bridgeReservedAgentToLead(call: any, leadCallControlId: string) {
     call_id: claimedCall.id,
     lead_id: claimedCall.lead_id,
     agent_id: claimedCall.agent_id,
+    group_id: claimedCall.group_id,
     agent_leg_id: claimedCall.agent_leg_id,
     lead_leg_id: leadCallControlId,
   })
@@ -433,55 +486,44 @@ async function maybeReleaseBatchAgent(supabaseClient: any, groupId: string, agen
       return
     }
 
-    console.log(`[BATCH] All siblings resolved — releasing agent ${agentId} to READY`)
-    await supabaseClient
-      .from('agent_sessions')
-      .update({ state: 'READY', active_call_id: null, updated_at: new Date().toISOString() })
+    const { data: batchCalls } = await supabaseClient
+      .from('calls')
+      .select('id, status, agent_leg_id')
+      .eq('group_id', groupId)
       .eq('agent_id', agentId)
 
-    // Immediately re-queue next batch — don't wait for tick
-    try {
-      const { data: freshSession } = await supabaseClient.from('agent_sessions')
-        .select('id')
-        .eq('agent_id', agentId)
-        .single()
-      if (freshSession) {
-        await dialQueue.add('dial-next', {
-          agentId,
-          sessionId: freshSession.id,
-          batchSize: TEST_BATCH_SIZE
-        }, { priority: 1, jobId: `immediate-${agentId}-${Date.now()}` })
-        console.log(`[BATCH] Immediately re-queued dial for agent ${agentId}`)
-      }
-    } catch (requeueErr) {
-      console.error(`[BATCH] Failed to re-queue for agent ${agentId}:`, requeueErr)
+    const completedBridge = (batchCalls ?? []).some((call: any) => call.status === 'completed' || call.status === 'bridged')
+    const agentLegIds = Array.from(new Set((batchCalls ?? []).map((call: any) => call.agent_leg_id).filter(Boolean)))
+
+    for (const agentLegId of agentLegIds) {
+      await telnyxAction(agentLegId as string, 'hangup')
     }
+
+    if (!completedBridge) {
+      console.log(`[BATCH_FAILED_RELEASE_AGENT] agent_id=${agentId} group_id=${groupId}`)
+    }
+
+    const nextState = completedBridge ? 'WRAP_UP' : 'READY'
+    const bridgedCall = (batchCalls ?? []).find((call: any) => call.status === 'completed' || call.status === 'bridged')
+    const sessionUpdate = completedBridge
+      ? { state: nextState, active_call_id: bridgedCall?.id ?? null, updated_at: new Date().toISOString() }
+      : { state: nextState, active_call_id: null, updated_at: new Date().toISOString() }
+
+    await supabaseClient
+      .from('agent_sessions')
+      .update(sessionUpdate)
+      .eq('agent_id', agentId)
+
+    if (!completedBridge) await setAgentCooldown(agentId)
+    else await releaseAgentBatchLock(agentId)
   } catch (err) {
     console.error(`[BATCH] maybeReleaseBatchAgent error for agent ${agentId}:`, err)
-    // Fallback: release agent directly to avoid it being stuck until healer fires
     try {
       await supabaseClient
         .from('agent_sessions')
         .update({ state: 'READY', active_call_id: null, updated_at: new Date().toISOString() })
         .eq('agent_id', agentId)
-
-      // Immediately re-queue next batch — don't wait for tick
-      try {
-        const { data: freshSession } = await supabaseClient.from('agent_sessions')
-          .select('id')
-          .eq('agent_id', agentId)
-          .single()
-        if (freshSession) {
-          await dialQueue.add('dial-next', {
-            agentId,
-            sessionId: freshSession.id,
-            batchSize: TEST_BATCH_SIZE
-          }, { priority: 1, jobId: `immediate-${agentId}-${Date.now()}` })
-          console.log(`[BATCH] Immediately re-queued dial for agent ${agentId}`)
-        }
-      } catch (requeueErr) {
-        console.error(`[BATCH] Failed to re-queue for agent ${agentId}:`, requeueErr)
-      }
+      await setAgentCooldown(agentId)
     } catch (fallbackErr) {
       console.error(`[BATCH] Fallback release also failed for agent ${agentId}:`, fallbackErr)
     }
@@ -502,23 +544,7 @@ async function releaseAgentForCall(call: { group_id?: string | null; agent_id?: 
     .update({ state: 'READY', active_call_id: null, updated_at: new Date().toISOString() })
     .eq('agent_id', agentId)
 
-  // Immediately re-queue next batch — don't wait for tick
-  try {
-    const { data: freshSession } = await supabase.from('agent_sessions')
-      .select('id')
-      .eq('agent_id', agentId)
-      .single()
-    if (freshSession) {
-      await dialQueue.add('dial-next', {
-        agentId,
-        sessionId: freshSession.id,
-        batchSize: TEST_BATCH_SIZE
-      }, { priority: 1, jobId: `immediate-${agentId}-${Date.now()}` })
-      console.log(`[BATCH] Immediately re-queued dial for agent ${agentId}`)
-    }
-  } catch (requeueErr) {
-    console.error(`[BATCH] Failed to re-queue for agent ${agentId}:`, requeueErr)
-  }
+  await setAgentCooldown(agentId)
 }
 
 export async function telnyxWebhookRoutes(app: FastifyInstance) {
@@ -645,6 +671,12 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
             ? clientState.lead_ids.filter(Boolean)
             : []
 
+          const { data: answeredPrimaryCall } = await supabase
+            .from('calls')
+            .select('group_id')
+            .eq('id', clientState.call_id)
+            .maybeSingle()
+
           console.log('[AGENT_ANSWERED] incoming', {
             callControlId,
             agent_id: clientState.agent_id,
@@ -655,24 +687,32 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
           const { data: reservedRows, error: reservedErr } = await supabase
             .from('agent_sessions')
             .update({
-              state: 'RESERVED',
+              state: 'IN_CALL',
               active_call_id: clientState.call_id,
               updated_at: now,
             })
             .eq('agent_id', clientState.agent_id)
-            .in('state', ['REGISTERED', 'READY', 'RESERVED'])
+            .in('state', ['RESERVED', 'IN_CALL'])
             .select('id, agent_id, state, active_call_id')
 
           if (reservedErr) {
-            console.error('[AGENT_ANSWERED] RESERVED update error:', reservedErr)
+            console.error('[AGENT_ANSWERED] IN_CALL update error:', reservedErr)
           }
 
           if (!reservedRows?.length) {
-            console.warn('[AGENT_ANSWERED] RESERVED update matched zero rows', {
+            console.warn('[AGENT_ANSWERED] IN_CALL update matched zero rows', {
               agent_id: clientState.agent_id,
               call_id: clientState.call_id,
             })
           }
+
+          console.log('[AGENT_ANSWERED_LOCKED]', {
+            agent_id: clientState.agent_id,
+            call_id: clientState.call_id,
+            group_id: answeredPrimaryCall?.group_id ?? null,
+            agent_call_control_id: callControlId,
+            session_rows: reservedRows ?? [],
+          })
 
           if (leadIds.length === 0) {
             const { data: primaryCall, error: primaryErr } = await supabase
@@ -725,7 +765,7 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
             })
             .in('lead_id', leadIds)
             .eq('agent_id', clientState.agent_id)
-            .in('status', ['created', 'agent_dialing', 'agent_answered'])
+            .in('status', ['created', 'agent_dialing'])
             .select('id, lead_id, status, agent_id, group_id')
 
           if (answeredErr) {
@@ -775,7 +815,7 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
             break
           }
 
-          await Promise.all((calls ?? []).map(async (call: any) => {
+          const leadDialResults = await Promise.all((calls ?? []).map(async (call: any) => {
             const leadsRelation = call.leads
             const phone = Array.isArray(leadsRelation)
               ? leadsRelation[0]?.phone
@@ -788,7 +828,7 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
                 leadsRelation,
               })
               await markLeadFailed(call.lead_id)
-              return
+              return false
             }
 
             console.log('[LEAD_DIAL_ATTEMPT]', {
@@ -831,6 +871,8 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
                   lead_leg_id: leadLegId,
                 })
                 .eq('id', call.id)
+                .eq('status', 'agent_answered')
+                .is('lead_leg_id', null)
                 .select('id, status, lead_leg_id')
 
               if (leadLegErr) {
@@ -842,6 +884,13 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
                 leadLegId,
                 rows: leadLegRows,
               })
+
+              if (!leadLegRows?.length) {
+                await telnyxAction(leadLegId, 'hangup')
+                return false
+              }
+
+              return true
             } else {
               console.error('[LEAD_DIAL_FAILED]', {
                 call_id: call.id,
@@ -864,8 +913,17 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
               // Let the existing sibling resolver release the agent back to READY
               // once the whole predictive batch has no active lead legs left.
               await releaseAgentForCall(call)
+              return false
             }
           }))
+
+          const groupId = calls?.[0]?.group_id ?? null
+          console.log('[LEADS_DIALED_ONCE]', {
+            agent_id: clientState.agent_id,
+            group_id: groupId,
+            batch_size: calls.length,
+            dialed: leadDialResults.filter(Boolean).length,
+          })
 
           break
         }
@@ -887,6 +945,14 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
             .from('calls')
             .update({ lead_leg_id: callControlId, answered_at: call.answered_at ?? now })
             .eq('id', call.id)
+
+          console.log('[LEAD_ANSWERED]', {
+            lead_id: call.lead_id,
+            call_id: call.id,
+            group_id: call.group_id,
+            agent_id: call.agent_id,
+            lead_call_control_id: callControlId,
+          })
 
           const bridged = await bridgeReservedAgentToLead(call, callControlId)
           if (!bridged) {
@@ -966,23 +1032,7 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
               })
               .eq('agent_id', agentId)
 
-            // Immediately re-queue next batch — don't wait for tick
-            try {
-              const { data: freshSession } = await supabase.from('agent_sessions')
-                .select('id')
-                .eq('agent_id', agentId)
-                .single()
-              if (freshSession) {
-                await dialQueue.add('dial-next', {
-                  agentId,
-                  sessionId: freshSession.id,
-                  batchSize: TEST_BATCH_SIZE
-                }, { priority: 1, jobId: `immediate-${agentId}-${Date.now()}` })
-                console.log(`[BATCH] Immediately re-queued dial for agent ${agentId}`)
-              }
-            } catch (requeueErr) {
-              console.error(`[BATCH] Failed to re-queue for agent ${agentId}:`, requeueErr)
-            }
+            await setAgentCooldown(agentId)
           }
         }
 
@@ -1058,6 +1108,19 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
             .eq('agent_leg_id', callControlId)
             .in('status', ['created', 'agent_dialing', 'agent_answered', 'lead_dialing', 'bridged'])
 
+          const groupIds = Array.from(new Set((calls ?? []).map((call: any) => call.group_id).filter(Boolean)))
+          console.log('[AGENT_HANGUP_CANCEL_BATCH]', {
+            agent_id: clientState.agent_id,
+            agent_call_control_id: callControlId,
+            group_ids: groupIds,
+            call_count: calls?.length ?? 0,
+          })
+
+          if (!calls?.length) {
+            await releaseAgentBatchLock(clientState.agent_id)
+            break
+          }
+
           for (const call of calls ?? []) {
             if (call.status === 'bridged') {
               if (call.lead_leg_id) await telnyxAction(call.lead_leg_id, 'hangup')
@@ -1083,9 +1146,14 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
                 await markLeadFailed(call.lead_id)
               }
             }
-
-            await releaseAgentForCall(call)
           }
+
+          await supabase
+            .from('agent_sessions')
+            .update({ state: 'REGISTERED', active_call_id: null, updated_at: now })
+            .eq('agent_id', clientState.agent_id)
+
+          await releaseAgentBatchLock(clientState.agent_id)
 
           break
         }
@@ -1100,23 +1168,20 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
           if (call && call.status !== 'completed' && call.status !== 'voicemail') {
             const completed = call.status === 'bridged'
 
-            if (call.answered_at || completed) {
+            await supabase
+              .from('calls')
+              .update({ status: completed ? 'completed' : 'no_answer', ended_at: now, wrapped_at: completed ? null : now })
+              .eq('id', call.id)
+
+            if (call.lead_id && !completed) {
               await supabase
-                .from('calls')
-                .update({ status: completed ? 'completed' : 'no_answer', ended_at: now, wrapped_at: completed ? null : now })
-                .eq('id', call.id)
-
-              if (call.lead_id && !completed) {
-                await supabase
-                  .from('leads')
-                  .update({ status: 'no_answer', assigned_agent_id: null })
-                  .eq('id', call.lead_id)
-              }
-
-              await releaseAgentForCall(call)
-              // Cooldown after no-answer: prevent ticker from immediately re-queuing the same agent
-              if (!completed && call.agent_id) await setAgentCooldown(call.agent_id)
+                .from('leads')
+                .update({ status: 'no_answer', assigned_agent_id: null })
+                .eq('id', call.lead_id)
             }
+
+            await releaseAgentForCall(call)
+            if (!completed && call.agent_id) await setAgentCooldown(call.agent_id)
           }
 
           break
@@ -1129,24 +1194,6 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
             .eq('agent_id', clientState.agent_id)
             .in('state', ['RESERVED', 'IN_CALL'])
           if (!releaseCount) console.warn(`[webhook] Agent ${clientState.agent_id} READY release rejected`)
-            // Immediately re-queue next batch — don't wait for tick
-            const agentIdInbound = clientState.agent_id
-            try {
-              const { data: freshSession } = await supabase.from('agent_sessions')
-                .select('id')
-                .eq('agent_id', agentIdInbound)
-                .single()
-              if (freshSession) {
-                await dialQueue.add('dial-next', {
-                  agentId: agentIdInbound,
-                  sessionId: freshSession.id,
-                  batchSize: TEST_BATCH_SIZE
-                }, { priority: 1, jobId: `immediate-${agentIdInbound}-${Date.now()}` })
-                console.log(`[BATCH] Immediately re-queued dial for agent ${agentIdInbound}`)
-              }
-            } catch (requeueErr) {
-              console.error(`[BATCH] Failed to re-queue for agent ${agentIdInbound}:`, requeueErr)
-            }
           await supabase
             .from('calls')
             .update({ status: 'completed', ended_at: now, wrapped_at: now })

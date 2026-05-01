@@ -135,7 +135,8 @@ const TEST_PHONE_NUMBERS = (process.env.TEST_PHONE_NUMBERS ?? '')
     .map((phone) => phone.trim())
     .filter(Boolean);
 const POST_RELEASE_COOLDOWN_MS = 2000; // delay before agent becomes eligible again
-const SOLO_AGENT_BATCH_SIZE = 2;
+const SOLO_AGENT_BATCH_SIZE = 3;
+const MULTI_AGENT_BATCH_SIZE = 3;
 let abandonmentMonitorTick = 0;
 function isTestPhoneNumber(phone) {
     return TEST_PHONE_NUMBERS.includes(phone) || (!!TEST_PHONE_NUMBER && phone === TEST_PHONE_NUMBER);
@@ -179,13 +180,15 @@ async function tick() {
         // Batch size rules:
         // 1 agent online  → 2:1 (enough coverage, not over-dialing solo)
         // 2+ agents online → 3:1 (full predictive, enough agents to handle pickups)
-        const batchSize = readyCount >= 2 ? 3 : 2;
-        console.log(`[TICKER] ${readyCount} agent(s) ready — batch size: ${batchSize}`);
+        const batchSize = readyCount >= 2 ? MULTI_AGENT_BATCH_SIZE : SOLO_AGENT_BATCH_SIZE;
+        console.log(`[TICKER] ${readyCount} agent(s) ready — batch size: ${batchSize} | mode=${DIALER_MODE} | test_numbers=${TEST_PHONE_NUMBERS.length}`);
         for (const session of readySessions) {
             const lockKey = `dialer:agent:${session.agent_id}:locked`;
             const locked = await redis.get(lockKey);
-            if (locked)
+            if (locked) {
+                console.log(`[TICKER_SKIP_AGENT_NOT_READY] agent_id=${session.agent_id} reason=redis_lock`);
                 continue;
+            }
             // Lock this agent for 30 seconds
             await redis.set(lockKey, '1', 'EX', 30);
             await dialQueue.add('dial-next', {
@@ -211,7 +214,7 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
         .eq('agent_id', agentId)
         .single();
     if (!session || session.state !== 'READY' || session.active_call_id) {
-        console.log(`[WORKER] Agent ${agentId} no longer READY — skipping`);
+        console.log(`[TICKER_SKIP_AGENT_NOT_READY] agent_id=${agentId} state=${session?.state ?? 'missing'} active_call_id=${session?.active_call_id ?? 'null'}`);
         await releaseLock(agentId);
         return;
     }
@@ -235,7 +238,7 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
         .select('agent_id')
         .single();
     if (!reservedSession || reserveError) {
-        console.log(`[WORKER] Agent ${agentId} no longer READY — skipping`);
+        console.log(`[TICKER_SKIP_AGENT_NOT_READY] agent_id=${agentId} reason=reserve_failed`);
         await releaseLock(agentId);
         return;
     }
@@ -278,37 +281,58 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
             return;
         }
     }
-    // Fetch candidates with SKIP LOCKED (prevents double-dial in concurrent workers)
-    const { data: allCandidates, error: fetchError } = await supabase.rpc('fetch_leads_skip_locked', {
-        p_campaign_id: campaign.id,
-        p_max_attempts: maxAttempts,
-        p_batch_size: 25,
-    });
-    if (fetchError) {
-        console.error(`[WORKER] Lead fetch error: ${fetchError.message}`);
-        await supabase
-            .from('agent_sessions')
-            .update({ state: 'READY', updated_at: new Date().toISOString() })
-            .eq('agent_id', agentId);
-        await releaseLock(agentId);
-        return;
-    }
-    // Filter by test phones if in test mode
-    let leads = (allCandidates ?? []);
+    let leads = [];
     if (filterPhones) {
-        leads = leads.filter(lead => filterPhones.includes(lead.phone));
-    }
-    leads = leads
-        .filter((lead) => {
-        if (isTestPhoneNumber(lead.phone)) {
-            return true;
+        // In test mode, fetch ONLY the controlled test leads directly.
+        // Do not rely on the production RPC candidate window, because it may return
+        // random real leads before the test leads and make filtering look empty.
+        const { data: testCandidates, error: testFetchError } = await supabase
+            .from('leads')
+            .select('id, campaign_id, phone, first_name, last_name, status, attempts, assigned_agent_id')
+            .eq('campaign_id', campaign.id)
+            .in('phone', filterPhones)
+            .in('status', ['pending', 'failed', 'no_answer', 'voicemail'])
+            .lt('attempts', maxAttempts)
+            .is('assigned_agent_id', null)
+            .order('last_name', { ascending: true })
+            .limit(batchSize);
+        if (testFetchError) {
+            console.error(`[WORKER] Test lead fetch error: ${testFetchError.message}`);
+            await supabase
+                .from('agent_sessions')
+                .update({ state: 'READY', updated_at: new Date().toISOString() })
+                .eq('agent_id', agentId);
+            await releaseLock(agentId);
+            return;
         }
-        if (!isTCPACallable(lead.phone, lead.timezone))
-            return false;
-        return true;
-    })
-        .slice(0, job.data.batchSize ?? 2);
-    if (leads.length < (job.data.batchSize ?? 2)) {
+        leads = (testCandidates ?? []);
+        console.log(`[WORKER] TEST MODE candidates: ${leads.map((l) => `${l.first_name ?? ''} ${l.last_name ?? ''} ${l.phone}`).join(' | ') || 'none'}`);
+    }
+    else {
+        // Production path: Fetch candidates with SKIP LOCKED.
+        const { data: allCandidates, error: fetchError } = await supabase.rpc('fetch_leads_skip_locked', {
+            p_campaign_id: campaign.id,
+            p_max_attempts: maxAttempts,
+            p_batch_size: 25,
+        });
+        if (fetchError) {
+            console.error(`[WORKER] Lead fetch error: ${fetchError.message}`);
+            await supabase
+                .from('agent_sessions')
+                .update({ state: 'READY', updated_at: new Date().toISOString() })
+                .eq('agent_id', agentId);
+            await releaseLock(agentId);
+            return;
+        }
+        leads = (allCandidates ?? [])
+            .filter((lead) => {
+            if (!isTCPACallable(lead.phone, lead.timezone))
+                return false;
+            return true;
+        })
+            .slice(0, batchSize);
+    }
+    if (leads.length < batchSize) {
         console.log(`[WORKER] No leads available — releasing agent ${agentId}`);
         await supabase
             .from('agent_sessions')
@@ -319,6 +343,8 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
     }
     const leadIds = leads.map((lead) => lead.id);
     const groupId = randomUUID();
+    await redis.set(`dialer:agent:${agentId}:locked`, groupId, 'EX', 900);
+    console.log(`[BATCH_CLAIM] agent_id=${agentId} group_id=${groupId} batch_size=${batchSize} lead_ids=${leadIds.join(',')}`);
     // 5. Reserve lead and count this as an attempted dial selection.
     const attemptedAt = new Date().toISOString();
     await supabase
@@ -369,6 +395,7 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
             })).toString('base64'),
         });
         const agentCallControlId = agentCallResponse.data.call_control_id;
+        console.log(`[AGENT_LEG_DIAL] agent_id=${agentId} destination=${agentDialTarget} group_id=${groupId} batch_size=${batchSize}`);
         // 8. Update call with agent leg, status=agent_dialing
         await supabase
             .from('calls')
@@ -387,9 +414,6 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
             .from('calls')
             .update({ status: 'failed', ended_at: new Date().toISOString() })
             .in('id', callIds);
-    }
-    finally {
-        await releaseLock(agentId);
     }
 }, {
     connection: redis,
@@ -424,6 +448,7 @@ async function failReservedLeads(agentId, leadIds) {
         .from('leads')
         .update({ status: 'failed', assigned_agent_id: null })
         .in('id', leadIds);
+    console.log(`[BATCH_FAILED_RELEASE_AGENT] agent_id=${agentId} lead_ids=${leadIds.join(',')}`);
     await releaseLock(agentId);
 }
 // ── Worker error handling ─────────────────────────────────

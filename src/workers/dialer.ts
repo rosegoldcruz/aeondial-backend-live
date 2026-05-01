@@ -200,7 +200,10 @@ async function tick() {
     for (const session of readySessions) {
       const lockKey = `dialer:agent:${session.agent_id}:locked`;
       const locked = await redis.get(lockKey);
-      if (locked) continue;
+      if (locked) {
+        console.log(`[TICKER_SKIP_AGENT_NOT_READY] agent_id=${session.agent_id} reason=redis_lock`);
+        continue;
+      }
 
       // Lock this agent for 30 seconds
       await redis.set(lockKey, '1', 'EX', 30);
@@ -233,7 +236,7 @@ const dialWorker = new Worker(
       .single();
 
     if (!session || session.state !== 'READY' || session.active_call_id) {
-      console.log(`[WORKER] Agent ${agentId} no longer READY — skipping`);
+      console.log(`[TICKER_SKIP_AGENT_NOT_READY] agent_id=${agentId} state=${session?.state ?? 'missing'} active_call_id=${session?.active_call_id ?? 'null'}`);
       await releaseLock(agentId);
       return;
     }
@@ -261,7 +264,7 @@ const dialWorker = new Worker(
       .single()
 
     if (!reservedSession || reserveError) {
-      console.log(`[WORKER] Agent ${agentId} no longer READY — skipping`)
+      console.log(`[TICKER_SKIP_AGENT_NOT_READY] agent_id=${agentId} reason=reserve_failed`)
       await releaseLock(agentId)
       return
     };
@@ -374,6 +377,9 @@ const dialWorker = new Worker(
     const leadIds = leads.map((lead) => lead.id);
     const groupId = randomUUID();
 
+    await redis.set(`dialer:agent:${agentId}:locked`, groupId, 'EX', 900);
+    console.log(`[BATCH_CLAIM] agent_id=${agentId} group_id=${groupId} batch_size=${batchSize} lead_ids=${leadIds.join(',')}`);
+
     // 5. Reserve lead and count this as an attempted dial selection.
     const attemptedAt = new Date().toISOString();
     await supabase
@@ -431,6 +437,8 @@ const dialWorker = new Worker(
 
       const agentCallControlId = agentCallResponse.data.call_control_id;
 
+      console.log(`[AGENT_LEG_DIAL] agent_id=${agentId} destination=${agentDialTarget} group_id=${groupId} batch_size=${batchSize}`);
+
       // 8. Update call with agent leg, status=agent_dialing
       await supabase
         .from('calls')
@@ -449,8 +457,6 @@ const dialWorker = new Worker(
         .from('calls')
         .update({ status: 'failed', ended_at: new Date().toISOString() })
         .in('id', callIds);
-    } finally {
-      await releaseLock(agentId);
     }
   },
   {
@@ -494,6 +500,8 @@ async function failReservedLeads(agentId: string, leadIds: string[]) {
     .from('leads')
     .update({ status: 'failed', assigned_agent_id: null })
     .in('id', leadIds);
+
+  console.log(`[BATCH_FAILED_RELEASE_AGENT] agent_id=${agentId} lead_ids=${leadIds.join(',')}`);
 
   await releaseLock(agentId);
 }
