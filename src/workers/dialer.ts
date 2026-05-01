@@ -159,6 +159,69 @@ function isTestPhoneNumber(phone: string): boolean {
   return TEST_PHONE_NUMBERS.includes(phone) || (!!TEST_PHONE_NUMBER && phone === TEST_PHONE_NUMBER);
 }
 
+async function resetTestModeLeads(campaignId: string, phones: string[]) {
+  const uniquePhones = Array.from(new Set(phones.map((phone) => phone.trim()).filter(Boolean)));
+  console.log('[TEST_MODE_NUMBERS]', { campaign_id: campaignId, count: uniquePhones.length, phones: uniquePhones });
+
+  if (uniquePhones.length === 0) return [];
+
+  const { data: existingLeads, error: existingError } = await supabase
+    .from('leads')
+    .select('id, phone')
+    .eq('campaign_id', campaignId)
+    .in('phone', uniquePhones);
+
+  if (existingError) throw existingError;
+
+  const existingPhones = new Set((existingLeads ?? []).map((lead: any) => lead.phone));
+  const missingPhones = uniquePhones.filter((phone) => !existingPhones.has(phone));
+
+  if (missingPhones.length > 0) {
+    const { error: insertError } = await supabase
+      .from('leads')
+      .insert(missingPhones.map((phone, index) => ({
+        campaign_id: campaignId,
+        phone,
+        first_name: 'AEON',
+        last_name: `Test ${index + 1}`,
+        status: 'pending',
+        attempts: 0,
+        assigned_agent_id: null,
+        quality: 'test',
+      })));
+
+    if (insertError) throw insertError;
+  }
+
+  const { data: resetLeads, error: resetError } = await supabase
+    .from('leads')
+    .update({
+      status: 'pending',
+      attempts: 0,
+      assigned_agent_id: null,
+      last_called_at: null,
+      callback_at: null,
+      dnc_at: null,
+      dnc_source: null,
+      last_voicemail_at: null,
+    })
+    .eq('campaign_id', campaignId)
+    .in('phone', uniquePhones)
+    .select('id, campaign_id, phone, first_name, last_name, status, attempts, assigned_agent_id, last_called_at');
+
+  if (resetError) throw resetError;
+
+  console.log('[TEST_MODE_LEADS_RESET]', {
+    campaign_id: campaignId,
+    configured_count: uniquePhones.length,
+    reset_count: resetLeads?.length ?? 0,
+    inserted_count: missingPhones.length,
+    leads: resetLeads ?? [],
+  });
+
+  return resetLeads ?? [];
+}
+
 function buildAgentDialTarget(sipUsername: string): string {
   // Each agent has their own Telnyx credential connection (anchorsite: Chicago, IL).
   // Agents register via WebRTC SDK using (username, password) from the credential
@@ -175,11 +238,17 @@ async function tick() {
     // Find all READY agents with no active call
     const { data: readySessions } = await supabase
       .from('agent_sessions')
-      .select('id, agent_id')
+      .select('id, agent_id, state, active_call_id')
       .eq('state', 'READY')
       .is('active_call_id', null);
 
-    if (!readySessions || readySessions.length === 0) return;
+    const readyCount = readySessions?.length ?? 0;
+    console.log(`[TICKER_SCAN] ready_count=${readyCount}`);
+
+    if (!readySessions || readySessions.length === 0) {
+      console.log('[TICKER_NO_READY_AGENTS]');
+      return;
+    }
 
     abandonmentMonitorTick += 1;
     if (abandonmentMonitorTick % 10 === 0) {
@@ -198,8 +267,6 @@ async function tick() {
       }
     }
 
-    const readyCount = readySessions.length;
-
     // Batch size rules:
     // 1 agent online  → 2:1 (enough coverage, not over-dialing solo)
     // 2+ agents online → 3:1 (full predictive, enough agents to handle pickups)
@@ -208,6 +275,8 @@ async function tick() {
     console.log(`[TICKER] ${readyCount} agent(s) ready — batch size: ${batchSize} | mode=${DIALER_MODE} | test_numbers=${TEST_PHONE_NUMBERS.length}`);
 
     for (const session of readySessions) {
+      console.log(`[TICKER_READY_AGENT] agent_id=${session.agent_id} state=${session.state} active_call_id=${session.active_call_id ?? 'null'}`);
+
       const lockKey = `dialer:agent:${session.agent_id}:locked`;
       const locked = await redis.get(lockKey);
       if (locked) {
@@ -321,13 +390,24 @@ const dialWorker = new Worker(
       // In test mode, fetch ONLY the controlled test leads directly.
       // Do not rely on the production RPC candidate window, because it may return
       // random real leads before the test leads and make filtering look empty.
+      try {
+        await resetTestModeLeads(campaign.id, filterPhones);
+      } catch (err: any) {
+        console.error(`[WORKER] Test lead reset error: ${err?.message ?? String(err)}`);
+        await supabase
+          .from('agent_sessions')
+          .update({ state: 'READY', updated_at: new Date().toISOString() })
+          .eq('agent_id', agentId);
+        await releaseLock(agentId);
+        return;
+      }
+
       const { data: testCandidates, error: testFetchError } = await supabase
         .from('leads')
         .select('id, campaign_id, phone, first_name, last_name, status, attempts, assigned_agent_id')
         .eq('campaign_id', campaign.id)
         .in('phone', filterPhones)
-        .in('status', ['pending', 'failed', 'no_answer', 'voicemail'])
-        .lt('attempts', maxAttempts)
+        .eq('status', 'pending')
         .is('assigned_agent_id', null)
         .order('last_name', { ascending: true })
         .limit(batchSize);
@@ -343,7 +423,19 @@ const dialWorker = new Worker(
       }
 
       leads = (testCandidates ?? []) as any[];
-      console.log(`[WORKER] TEST MODE candidates: ${leads.map((l) => `${l.first_name ?? ''} ${l.last_name ?? ''} ${l.phone}`).join(' | ') || 'none'}`);
+      console.log('[TEST_MODE_CANDIDATES]', {
+        campaign_id: campaign.id,
+        configured_count: filterPhones.length,
+        candidate_count: leads.length,
+        batch_size: batchSize,
+        candidates: leads.map((lead) => ({
+          id: lead.id,
+          phone: lead.phone,
+          status: lead.status,
+          attempts: lead.attempts,
+          assigned_agent_id: lead.assigned_agent_id,
+        })),
+      });
     } else {
       // Production path: Fetch candidates with SKIP LOCKED.
       const { data: allCandidates, error: fetchError } = await supabase.rpc('fetch_leads_skip_locked', {
@@ -370,7 +462,14 @@ const dialWorker = new Worker(
         .slice(0, batchSize);
     }
 
-    if (leads.length < batchSize) {
+    if (leads.length === 0) {
+      if (filterPhones) {
+        console.log('[TEST_MODE_NO_CANDIDATES]', {
+          campaign_id: campaign.id,
+          configured_count: filterPhones.length,
+          batch_size: batchSize,
+        });
+      }
       console.log(`[WORKER] No leads available — releasing agent ${agentId}`);
       await supabase
         .from('agent_sessions')
@@ -441,21 +540,26 @@ const dialWorker = new Worker(
       console.log('[TELNYX_ORIGINATE_AGENT_REQUEST]', {
         agent_id: agentId,
         group_id: groupId,
+        connection_id: process.env.TELNYX_CONNECTION_ID,
+        from: process.env.TELNYX_OUTBOUND_NUMBER,
+        to: agentDialTarget,
         destination: agentDialTarget,
         call_id: primaryCallId,
         lead_ids: leadIds,
-        has_connection_id: !!process.env.TELNYX_CONNECTION_ID,
-        from: process.env.TELNYX_OUTBOUND_NUMBER,
+        request_body: agentDialRequest,
       });
 
       const agentCallResponse = await telnyx.calls.dial(agentDialRequest);
 
-      const agentCallControlId = agentCallResponse.data.call_control_id;
+      const agentCallControlId = agentCallResponse.data.call_control_id ?? agentCallResponse.data.callControlId;
+      const agentCallLegId = agentCallResponse.data.call_leg_id ?? agentCallResponse.data.callLegId;
 
       console.log('[TELNYX_ORIGINATE_AGENT_RESPONSE]', {
         agent_id: agentId,
         group_id: groupId,
         call_id: primaryCallId,
+        call_control_id: agentCallControlId,
+        call_leg_id: agentCallLegId,
         agent_call_control_id: agentCallControlId,
         response: agentCallResponse.data,
       });
