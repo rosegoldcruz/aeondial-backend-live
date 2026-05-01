@@ -135,9 +135,18 @@ const TEST_PHONE_NUMBERS = (process.env.TEST_PHONE_NUMBERS ?? '')
     .map((phone) => phone.trim())
     .filter(Boolean);
 const POST_RELEASE_COOLDOWN_MS = 2000; // delay before agent becomes eligible again
+const ORIGINATE_FAILURE_COOLDOWN_MS = 30000;
 const SOLO_AGENT_BATCH_SIZE = 3;
 const MULTI_AGENT_BATCH_SIZE = 3;
 let abandonmentMonitorTick = 0;
+function getErrorDetails(err) {
+    return {
+        message: err?.message ?? String(err),
+        code: err?.code,
+        statusCode: err?.statusCode ?? err?.status,
+        raw: err?.raw ?? err?.response?.data ?? err,
+    };
+}
 function isTestPhoneNumber(phone) {
     return TEST_PHONE_NUMBERS.includes(phone) || (!!TEST_PHONE_NUMBER && phone === TEST_PHONE_NUMBER);
 }
@@ -207,17 +216,23 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
     const { agentId } = job.data;
     const batchSize = Number(job.data.batchSize ?? SOLO_AGENT_BATCH_SIZE);
     console.log(`[WORKER] Processing dial-next for agent: ${agentId}`);
-    // 1. Re-verify agent is still READY (state may have changed)
-    const { data: session } = await supabase
+    // 1. Reserve agent atomically. READY is required only at the claim boundary.
+    const groupId = randomUUID();
+    const { data: reservedSession, error: reserveError } = await supabase
         .from('agent_sessions')
-        .select('state, active_call_id, telnyx_client_state')
+        .update({ state: 'RESERVED', updated_at: new Date().toISOString() })
         .eq('agent_id', agentId)
-        .single();
-    if (!session || session.state !== 'READY' || session.active_call_id) {
-        console.log(`[TICKER_SKIP_AGENT_NOT_READY] agent_id=${agentId} state=${session?.state ?? 'missing'} active_call_id=${session?.active_call_id ?? 'null'}`);
+        .eq('state', 'READY')
+        .is('active_call_id', null)
+        .select('agent_id, state, active_call_id')
+        .maybeSingle();
+    if (!reservedSession || reserveError) {
+        console.log(`[TICKER_SKIP_AGENT_NOT_READY] agent_id=${agentId} reason=reserve_failed`);
         await releaseLock(agentId);
         return;
     }
+    await redis.set(`dialer:agent:${agentId}:locked`, groupId, 'EX', 900);
+    console.log(`[BATCH_CLAIM] agent_id=${agentId} group_id=${groupId} batch_size=${batchSize}`);
     // 2. Get agent info
     const { data: agent } = await supabase
         .from('agents')
@@ -226,23 +241,13 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
         .single();
     if (!agent?.telnyx_sip_username) {
         console.error(`[WORKER] Agent ${agentId} has no Telnyx SIP username`);
+        await supabase
+            .from('agent_sessions')
+            .update({ state: 'READY', active_call_id: null, updated_at: new Date().toISOString() })
+            .eq('agent_id', agentId);
         await releaseLock(agentId);
         return;
     }
-    // 3. Reserve agent atomically — if RETURNING is empty, agent was already taken, skip
-    const { data: reservedSession, error: reserveError } = await supabase
-        .from('agent_sessions')
-        .update({ state: 'RESERVED', updated_at: new Date().toISOString() })
-        .eq('agent_id', agentId)
-        .eq('state', 'READY') // guard: only if still READY
-        .select('agent_id')
-        .single();
-    if (!reservedSession || reserveError) {
-        console.log(`[TICKER_SKIP_AGENT_NOT_READY] agent_id=${agentId} reason=reserve_failed`);
-        await releaseLock(agentId);
-        return;
-    }
-    ;
     // 4. Pick next lead from active campaign and enforce attempts cap
     const { data: campaign } = await supabase
         .from('campaigns')
@@ -342,9 +347,6 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
         return;
     }
     const leadIds = leads.map((lead) => lead.id);
-    const groupId = randomUUID();
-    await redis.set(`dialer:agent:${agentId}:locked`, groupId, 'EX', 900);
-    console.log(`[BATCH_CLAIM] agent_id=${agentId} group_id=${groupId} batch_size=${batchSize} lead_ids=${leadIds.join(',')}`);
     // 5. Reserve lead and count this as an attempted dial selection.
     const attemptedAt = new Date().toISOString();
     await supabase
@@ -382,7 +384,7 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
         // 7. Dial ONLY the agent leg. The lead leg is dialed by the webhook handler
         //    when this agent leg is answered. This avoids ringing the lead before
         //    the agent is actually on the line.
-        const agentCallResponse = await telnyx.calls.dial({
+        const agentDialRequest = {
             connection_id: process.env.TELNYX_CONNECTION_ID,
             to: agentDialTarget,
             from: process.env.TELNYX_OUTBOUND_NUMBER,
@@ -393,9 +395,26 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
                 agent_id: agentId,
                 lead_ids: leadIds,
             })).toString('base64'),
-        });
-        const agentCallControlId = agentCallResponse.data.call_control_id;
+        };
         console.log(`[AGENT_LEG_DIAL] agent_id=${agentId} destination=${agentDialTarget} group_id=${groupId} batch_size=${batchSize}`);
+        console.log('[TELNYX_ORIGINATE_AGENT_REQUEST]', {
+            agent_id: agentId,
+            group_id: groupId,
+            destination: agentDialTarget,
+            call_id: primaryCallId,
+            lead_ids: leadIds,
+            has_connection_id: !!process.env.TELNYX_CONNECTION_ID,
+            from: process.env.TELNYX_OUTBOUND_NUMBER,
+        });
+        const agentCallResponse = await telnyx.calls.dial(agentDialRequest);
+        const agentCallControlId = agentCallResponse.data.call_control_id;
+        console.log('[TELNYX_ORIGINATE_AGENT_RESPONSE]', {
+            agent_id: agentId,
+            group_id: groupId,
+            call_id: primaryCallId,
+            agent_call_control_id: agentCallControlId,
+            response: agentCallResponse.data,
+        });
         // 8. Update call with agent leg, status=agent_dialing
         await supabase
             .from('calls')
@@ -408,11 +427,22 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
         console.log(`[WORKER] Dialing agent ${agentDialTarget} | leads held: ${leadIds.join(',')} | batch size: ${batchSize} | group: ${groupId}`);
     }
     catch (err) {
-        console.error(`[WORKER] Agent dial failed: ${err.message}`);
+        const errorDetails = getErrorDetails(err);
+        console.error('[TELNYX_ORIGINATE_AGENT_ERROR]', {
+            agent_id: agentId,
+            group_id: groupId,
+            call_ids: callIds,
+            error: errorDetails,
+        });
+        console.error(`[WORKER] Agent dial failed: ${errorDetails.message}`);
         await failReservedLeads(agentId, leadIds);
         await supabase
             .from('calls')
-            .update({ status: 'failed', ended_at: new Date().toISOString() })
+            .update({
+            status: 'failed',
+            notes: JSON.stringify({ telnyx_agent_originate_error: errorDetails }),
+            ended_at: new Date().toISOString(),
+        })
             .in('id', callIds);
     }
 }, {
@@ -449,7 +479,7 @@ async function failReservedLeads(agentId, leadIds) {
         .update({ status: 'failed', assigned_agent_id: null })
         .in('id', leadIds);
     console.log(`[BATCH_FAILED_RELEASE_AGENT] agent_id=${agentId} lead_ids=${leadIds.join(',')}`);
-    await releaseLock(agentId);
+    await redis.set(`dialer:agent:${agentId}:locked`, '1', 'PX', ORIGINATE_FAILURE_COOLDOWN_MS);
 }
 // ── Worker error handling ─────────────────────────────────
 dialWorker.on('failed', (job, err) => {
