@@ -15,6 +15,11 @@ export async function getAbandonmentRate(supabase, campaignId) {
     return (abandoned.length / answered.length) * 100;
 }
 export async function checkAndPauseCampaignIfNeeded(supabase, campaignId) {
+    const dialerMode = (process.env.DIALER_MODE || 'live').toLowerCase();
+    if (dialerMode === 'test') {
+        console.log('[COMPLIANCE] Test mode active — skipping abandonment auto-pause');
+        return false;
+    }
     const rate = await getAbandonmentRate(supabase, campaignId);
     console.log(`[COMPLIANCE] Abandonment rate: ${rate.toFixed(2)}% for campaign ${campaignId}`);
     if (rate >= 3) {
