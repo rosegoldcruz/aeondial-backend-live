@@ -231,7 +231,7 @@ export async function callRoutes(app: FastifyInstance) {
     }
 
     await telnyxAction(call.lead_leg_id, 'playback_start', {
-      audio_url: 'https://api.aeondial.com/static/VoicemailDrop.mp3',
+      audio_url: 'https://api.aeondial.com/audio/VoicemailDrop.mp3',
       loop: 'once',
       client_state: encodeState({ call_id: id, action: 'manual_voicemail' }),
     });

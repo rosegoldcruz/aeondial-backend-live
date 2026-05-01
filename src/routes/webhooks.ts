@@ -4,14 +4,15 @@ import { redis } from '../lib/redis.js'
 import { dialQueue } from '../lib/dialQueue.js'
 
 const POST_RELEASE_COOLDOWN_MS = 2000
+const TEST_BATCH_SIZE = 3
 
 async function setAgentCooldown(agentId: string, ms = POST_RELEASE_COOLDOWN_MS) {
   await redis.set(`dialer:agent:${agentId}:locked`, '1', 'PX', ms)
 }
 
 const TELNYX_API = 'https://api.telnyx.com/v2'
-const VOICEMAIL_DROP_URL = 'https://api.aeondial.com/static/VoicemailDrop.mp3'
-const LIVE_ANSWER_IVR_URL = 'https://api.aeondial.com/static/LiveAnswerIVR.mp3'
+const VOICEMAIL_DROP_URL = 'https://api.aeondial.com/audio/VoicemailDrop.mp3'
+const LIVE_ANSWER_IVR_URL = 'https://api.aeondial.com/audio/LiveAnswerIVR.mp3'
 
 type ClientState = {
   leg_type?: 'agent' | 'lead'
@@ -194,35 +195,92 @@ async function bridgeLegs(agentLegId: string, leadCallControlId: string, callId:
 async function bridgeReservedAgentToLead(call: any, leadCallControlId: string) {
   if (!call.agent_id || !call.agent_leg_id || isTerminalCallStatus(call.status)) return false
 
-  const { data: agentSession } = await supabase
-    .from('agent_sessions')
-    .select('state')
-    .eq('agent_id', call.agent_id)
+  const now = new Date().toISOString()
+
+  if (call.group_id) {
+    const { data: alreadyBridged } = await supabase
+      .from('calls')
+      .select('id, lead_id, lead_leg_id')
+      .eq('group_id', call.group_id)
+      .eq('status', 'bridged')
+      .neq('id', call.id)
+      .limit(1)
+
+    if (alreadyBridged?.length) {
+      console.log('[OVERFLOW_IVR] bridge skipped; sibling already bridged', {
+        call_id: call.id,
+        lead_id: call.lead_id,
+        bridged_sibling: alreadyBridged[0],
+      })
+      return false
+    }
+  }
+
+  const { data: claimedCall, error: claimCallError } = await supabase
+    .from('calls')
+    .update({ status: 'lead_answered', lead_leg_id: leadCallControlId, answered_at: call.answered_at ?? now })
+    .eq('id', call.id)
+    .in('status', ['created', 'agent_answered', 'lead_dialing', 'lead_answered'])
+    .select('id, lead_id, agent_id, agent_leg_id, group_id, status')
     .single()
 
-  const agentAvailable = agentSession?.state === 'RESERVED'
-  if (!agentAvailable) return false
+  if (claimCallError || !claimedCall) {
+    console.warn('[BRIDGE_CLAIM] call claim failed', {
+      call_id: call.id,
+      lead_id: call.lead_id,
+      error: claimCallError,
+    })
+    return false
+  }
 
-  const bridge = await bridgeLegs(call.agent_leg_id, leadCallControlId, call.id)
-  if (!bridge.ok) return false
+  const { data: agentSession, error: sessionClaimError } = await supabase
+    .from('agent_sessions')
+    .update({ state: 'IN_CALL', active_call_id: call.id, updated_at: now })
+    .eq('agent_id', claimedCall.agent_id)
+    .eq('state', 'RESERVED')
+    .select('agent_id, state, active_call_id')
+    .single()
 
-  const now = new Date().toISOString()
+  if (sessionClaimError || !agentSession) {
+    console.log('[OVERFLOW_IVR] bridge skipped; agent session not RESERVED', {
+      call_id: claimedCall.id,
+      lead_id: claimedCall.lead_id,
+      agent_id: claimedCall.agent_id,
+      error: sessionClaimError,
+    })
+    return false
+  }
+
+  const bridge = await bridgeLegs(claimedCall.agent_leg_id, leadCallControlId, claimedCall.id)
+  if (!bridge.ok) {
+    await supabase
+      .from('agent_sessions')
+      .update({ state: 'RESERVED', active_call_id: claimedCall.id, updated_at: new Date().toISOString() })
+      .eq('agent_id', claimedCall.agent_id)
+      .eq('state', 'IN_CALL')
+      .eq('active_call_id', claimedCall.id)
+    return false
+  }
+
   await supabase
     .from('calls')
     .update({ status: 'bridged', lead_leg_id: leadCallControlId, answered_at: now, bridged_at: now })
-    .eq('id', call.id)
+    .eq('id', claimedCall.id)
 
-  await supabase
-    .from('agent_sessions')
-    .update({ state: 'IN_CALL', active_call_id: call.id, updated_at: now })
-    .eq('agent_id', call.agent_id)
-
-  if (call.lead_id) {
+  if (claimedCall.lead_id) {
     await supabase
       .from('leads')
       .update({ status: 'answered' })
-      .eq('id', call.lead_id)
+      .eq('id', claimedCall.lead_id)
   }
+
+  console.log('[BRIDGE_SUCCESS]', {
+    call_id: claimedCall.id,
+    lead_id: claimedCall.lead_id,
+    agent_id: claimedCall.agent_id,
+    agent_leg_id: claimedCall.agent_leg_id,
+    lead_leg_id: leadCallControlId,
+  })
 
   return true
 }
@@ -254,6 +312,14 @@ async function dropVoicemail(callControlId: string, callId: string, leadId: stri
     console.error(`[voicemail] Failed to start VM playback for call ${callId}`)
     return false
   }
+
+  console.log('[VOICEMAIL_DROP]', {
+    call_id: callId,
+    lead_id: leadId,
+    lead_call_control_id: callControlId,
+    action,
+    audio_url: VOICEMAIL_DROP_URL,
+  })
 
   await supabase
     .from('calls')
@@ -383,7 +449,7 @@ async function maybeReleaseBatchAgent(supabaseClient: any, groupId: string, agen
         await dialQueue.add('dial-next', {
           agentId,
           sessionId: freshSession.id,
-          batchSize: 2
+          batchSize: TEST_BATCH_SIZE
         }, { priority: 1, jobId: `immediate-${agentId}-${Date.now()}` })
         console.log(`[BATCH] Immediately re-queued dial for agent ${agentId}`)
       }
@@ -409,7 +475,7 @@ async function maybeReleaseBatchAgent(supabaseClient: any, groupId: string, agen
           await dialQueue.add('dial-next', {
             agentId,
             sessionId: freshSession.id,
-            batchSize: 2
+            batchSize: TEST_BATCH_SIZE
           }, { priority: 1, jobId: `immediate-${agentId}-${Date.now()}` })
           console.log(`[BATCH] Immediately re-queued dial for agent ${agentId}`)
         }
@@ -446,7 +512,7 @@ async function releaseAgentForCall(call: { group_id?: string | null; agent_id?: 
       await dialQueue.add('dial-next', {
         agentId,
         sessionId: freshSession.id,
-        batchSize: 2
+        batchSize: TEST_BATCH_SIZE
       }, { priority: 1, jobId: `immediate-${agentId}-${Date.now()}` })
       console.log(`[BATCH] Immediately re-queued dial for agent ${agentId}`)
     }
@@ -551,6 +617,13 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
 
       case 'call.answered': {
         if (clientState.leg_type === 'agent' && clientState.agent_id && clientState.call_id) {
+          // === START INSTRUMENTATION (add right after if (clientState.leg_type === 'agent' && ...))
+          console.log('[WEBHOOK] AGENT_ANSWERED_FULL_CONTEXT', {
+            callControlId, decodedClientState: clientState, leadIds: clientState.lead_ids ?? []
+          });
+          // After agent_answered update and after selecting calls for lead dialing, before/after each telnyxDial, and after lead_leg_id update — add similar detailed logs for every step + guard logs for empty leadIds / zero calls / missing phone.
+          // === END INSTRUMENTATION
+
           const now = new Date().toISOString()
 
           if (clientState.action === 'inbound_agent') {
@@ -737,6 +810,7 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
                 leg_type: 'lead',
                 call_id: call.id,
                 agent_id: clientState.agent_id,
+                lead_id: call.lead_id,
               }),
             })
 
@@ -902,7 +976,7 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
                 await dialQueue.add('dial-next', {
                   agentId,
                   sessionId: freshSession.id,
-                  batchSize: 2
+                  batchSize: TEST_BATCH_SIZE
                 }, { priority: 1, jobId: `immediate-${agentId}-${Date.now()}` })
                 console.log(`[BATCH] Immediately re-queued dial for agent ${agentId}`)
               }
@@ -1066,7 +1140,7 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
                 await dialQueue.add('dial-next', {
                   agentId: agentIdInbound,
                   sessionId: freshSession.id,
-                  batchSize: 2
+                  batchSize: TEST_BATCH_SIZE
                 }, { priority: 1, jobId: `immediate-${agentIdInbound}-${Date.now()}` })
                 console.log(`[BATCH] Immediately re-queued dial for agent ${agentIdInbound}`)
               }

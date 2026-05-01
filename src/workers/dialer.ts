@@ -141,8 +141,8 @@ const TEST_PHONE_NUMBERS = (process.env.TEST_PHONE_NUMBERS ?? '')
   .map((phone) => phone.trim())
   .filter(Boolean);
 const POST_RELEASE_COOLDOWN_MS = 2000; // delay before agent becomes eligible again
-const SOLO_AGENT_BATCH_SIZE = Number(process.env.DIALER_SOLO_BATCH_SIZE ?? 2);
-const MULTI_AGENT_BATCH_SIZE = Number(process.env.DIALER_MULTI_BATCH_SIZE ?? 3);
+const SOLO_AGENT_BATCH_SIZE = 3;
+const MULTI_AGENT_BATCH_SIZE = 3;
 let abandonmentMonitorTick = 0;
 
 function isTestPhoneNumber(phone: string): boolean {
@@ -361,7 +361,7 @@ const dialWorker = new Worker(
         .slice(0, batchSize);
     }
 
-    if (leads.length < (job.data.batchSize ?? 2)) {
+    if (leads.length < batchSize) {
       console.log(`[WORKER] No leads available — releasing agent ${agentId}`);
       await supabase
         .from('agent_sessions')
