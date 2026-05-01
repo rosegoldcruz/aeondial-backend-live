@@ -280,7 +280,14 @@ async function dropVoicemail(callControlId: string, callId: string, leadId: stri
 }
 
 async function playLiveAnswerIvr(callControlId: string, callId: string, leadId?: string | null) {
-  await telnyxAction(callControlId, 'gather_using_audio', {
+  console.log('[OVERFLOW_IVR] starting live answer IVR', {
+    call_id: callId,
+    lead_id: leadId ?? null,
+    lead_call_control_id: callControlId,
+    audio_url: LIVE_ANSWER_IVR_URL,
+  })
+
+  const ivr = await telnyxAction(callControlId, 'gather_using_audio', {
     audio_url: LIVE_ANSWER_IVR_URL,
     gather_digits: '2',
     gather_timeout: 15,
@@ -290,6 +297,15 @@ async function playLiveAnswerIvr(callControlId: string, callId: string, leadId?:
       action: 'ivr_response',
     }),
   })
+
+  console.log('[IVR_START_RESULT]', {
+    call_id: callId,
+    lead_id: leadId ?? null,
+    ok: ivr.ok,
+    status: ivr.status,
+  })
+
+  return ivr
 }
 
 async function markVoicemailAndHangup(callControlId: string, callId: string, leadId?: string | null) {
@@ -769,6 +785,11 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
                 .eq('id', call.id)
 
               await markLeadFailed(call.lead_id)
+
+              // If lead dialing fails at the provider layer, do not strand the agent.
+              // Let the existing sibling resolver release the agent back to READY
+              // once the whole predictive batch has no active lead legs left.
+              await releaseAgentForCall(call)
             }
           }))
 
@@ -795,6 +816,13 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
 
           const bridged = await bridgeReservedAgentToLead(call, callControlId)
           if (!bridged) {
+            console.log('[OVERFLOW_IVR] lead answered but agent unavailable; using IVR fallback', {
+              call_id: call.id,
+              lead_id: call.lead_id,
+              agent_id: call.agent_id,
+              previous_status: call.status,
+              lead_call_control_id: callControlId,
+            })
             await playLiveAnswerIvr(callControlId, call.id, call.lead_id)
           }
         }
@@ -817,6 +845,14 @@ export async function telnyxWebhookRoutes(app: FastifyInstance) {
             await telnyxAction(callControlId, 'hangup')
             break
           }
+
+          console.log('[IVR_RESPONSE]', {
+            call_id: call.id,
+            lead_id: call.lead_id,
+            agent_id: call.agent_id,
+            digit,
+            event,
+          })
 
           if (digit === '1') {
             const agentDialing = await dialReadyAgentForLead(callControlId, call.id, call.lead_id)

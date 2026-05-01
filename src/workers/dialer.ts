@@ -141,7 +141,8 @@ const TEST_PHONE_NUMBERS = (process.env.TEST_PHONE_NUMBERS ?? '')
   .map((phone) => phone.trim())
   .filter(Boolean);
 const POST_RELEASE_COOLDOWN_MS = 2000; // delay before agent becomes eligible again
-const SOLO_AGENT_BATCH_SIZE = 2;
+const SOLO_AGENT_BATCH_SIZE = Number(process.env.DIALER_SOLO_BATCH_SIZE ?? 2);
+const MULTI_AGENT_BATCH_SIZE = Number(process.env.DIALER_MULTI_BATCH_SIZE ?? 3);
 let abandonmentMonitorTick = 0;
 
 function isTestPhoneNumber(phone: string): boolean {
@@ -192,9 +193,9 @@ async function tick() {
     // Batch size rules:
     // 1 agent online  → 2:1 (enough coverage, not over-dialing solo)
     // 2+ agents online → 3:1 (full predictive, enough agents to handle pickups)
-    const batchSize = readyCount >= 2 ? 3 : 2;
+    const batchSize = readyCount >= 2 ? MULTI_AGENT_BATCH_SIZE : SOLO_AGENT_BATCH_SIZE;
 
-    console.log(`[TICKER] ${readyCount} agent(s) ready — batch size: ${batchSize}`);
+    console.log(`[TICKER] ${readyCount} agent(s) ready — batch size: ${batchSize} | mode=${DIALER_MODE} | test_numbers=${TEST_PHONE_NUMBERS.length}`);
 
     for (const session of readySessions) {
       const lockKey = `dialer:agent:${session.agent_id}:locked`;
@@ -305,40 +306,60 @@ const dialWorker = new Worker(
       }
     }
 
-    // Fetch candidates with SKIP LOCKED (prevents double-dial in concurrent workers)
-    const { data: allCandidates, error: fetchError } = await supabase.rpc('fetch_leads_skip_locked', {
-      p_campaign_id: campaign.id,
-      p_max_attempts: maxAttempts,
-      p_batch_size: 25,
-    });
+    let leads: any[] = [];
 
-    if (fetchError) {
-      console.error(`[WORKER] Lead fetch error: ${fetchError.message}`);
-      await supabase
-        .from('agent_sessions')
-        .update({ state: 'READY', updated_at: new Date().toISOString() })
-        .eq('agent_id', agentId);
-      await releaseLock(agentId);
-      return;
-    }
-
-    // Filter by test phones if in test mode
-    let leads = (allCandidates ?? []) as any[];
     if (filterPhones) {
-      leads = leads.filter(lead => filterPhones!.includes(lead.phone));
-    }
+      // In test mode, fetch ONLY the controlled test leads directly.
+      // Do not rely on the production RPC candidate window, because it may return
+      // random real leads before the test leads and make filtering look empty.
+      const { data: testCandidates, error: testFetchError } = await supabase
+        .from('leads')
+        .select('id, campaign_id, phone, first_name, last_name, status, attempts, assigned_agent_id')
+        .eq('campaign_id', campaign.id)
+        .in('phone', filterPhones)
+        .in('status', ['pending', 'failed', 'no_answer', 'voicemail'])
+        .lt('attempts', maxAttempts)
+        .is('assigned_agent_id', null)
+        .order('last_name', { ascending: true })
+        .limit(batchSize);
 
-    leads = leads
-      .filter((lead) => {
-        if (isTestPhoneNumber(lead.phone)) {
+      if (testFetchError) {
+        console.error(`[WORKER] Test lead fetch error: ${testFetchError.message}`);
+        await supabase
+          .from('agent_sessions')
+          .update({ state: 'READY', updated_at: new Date().toISOString() })
+          .eq('agent_id', agentId);
+        await releaseLock(agentId);
+        return;
+      }
+
+      leads = (testCandidates ?? []) as any[];
+      console.log(`[WORKER] TEST MODE candidates: ${leads.map((l) => `${l.first_name ?? ''} ${l.last_name ?? ''} ${l.phone}`).join(' | ') || 'none'}`);
+    } else {
+      // Production path: Fetch candidates with SKIP LOCKED.
+      const { data: allCandidates, error: fetchError } = await supabase.rpc('fetch_leads_skip_locked', {
+        p_campaign_id: campaign.id,
+        p_max_attempts: maxAttempts,
+        p_batch_size: 25,
+      });
+
+      if (fetchError) {
+        console.error(`[WORKER] Lead fetch error: ${fetchError.message}`);
+        await supabase
+          .from('agent_sessions')
+          .update({ state: 'READY', updated_at: new Date().toISOString() })
+          .eq('agent_id', agentId);
+        await releaseLock(agentId);
+        return;
+      }
+
+      leads = ((allCandidates ?? []) as any[])
+        .filter((lead) => {
+          if (!isTCPACallable(lead.phone, (lead as any).timezone)) return false;
           return true;
-        }
-
-        if (!isTCPACallable(lead.phone, (lead as any).timezone)) return false;
-
-        return true;
-      })
-      .slice(0, job.data.batchSize ?? 2);
+        })
+        .slice(0, batchSize);
+    }
 
     if (leads.length < (job.data.batchSize ?? 2)) {
       console.log(`[WORKER] No leads available — releasing agent ${agentId}`);

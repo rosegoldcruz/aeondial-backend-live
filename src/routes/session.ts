@@ -93,20 +93,35 @@ export async function sessionRoutes(app: FastifyInstance) {
     return reply.send({ state: 'PAUSED' });
   });
 
-  // POST /session/register — mark WebRTC as registered
+  // POST /session/register — mark WebRTC as registered without downgrading active dialer state
   app.post('/register', { onRequest: [app.authenticate] } as any, async (req: any, reply) => {
     const { agentId } = req.user;
+    const now = new Date().toISOString();
+
+    const { data: session } = await supabase
+      .from('agent_sessions')
+      .select('state')
+      .eq('agent_id', agentId)
+      .single();
+
+    const currentState = session?.state ?? 'REGISTERED';
+
+    // Registering WebRTC should not kick an agent out of the predictive loop.
+    // It should only move OFFLINE/ERROR/empty sessions into REGISTERED.
+    const nextState = ['READY', 'RESERVED', 'IN_CALL', 'WRAP_UP', 'PAUSED'].includes(currentState)
+      ? currentState
+      : 'REGISTERED';
 
     await supabase
       .from('agent_sessions')
       .update({
-        state: 'REGISTERED',
+        state: nextState,
         telnyx_client_state: 'registered',
-        updated_at: new Date().toISOString(),
+        updated_at: now,
       })
       .eq('agent_id', agentId);
 
-    return reply.send({ state: 'REGISTERED' });
+    return reply.send({ state: nextState });
   });
 
   // GET /session/webrtc-token — generate Telnyx WebRTC token for agent
