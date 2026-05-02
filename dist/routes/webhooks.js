@@ -76,6 +76,91 @@ function getGatherDigit(callData) {
 function getMachineDetectionResult(callData) {
     return String(callData?.result ?? callData?.machine_detection_result ?? callData?.answering_machine_detection_result ?? '').toLowerCase();
 }
+async function findCallByLegId(callControlId) {
+    if (!callControlId)
+        return null;
+    const selectColumns = 'id, lead_id, agent_id, group_id, status, agent_leg_id, lead_leg_id, call_control_id';
+    const { data: agentRows } = await supabase
+        .from('calls')
+        .select(selectColumns)
+        .eq('agent_leg_id', callControlId)
+        .order('created_at', { ascending: false })
+        .limit(1);
+    if (agentRows?.[0])
+        return { call: agentRows[0], legType: 'agent', source: 'db_agent_leg' };
+    const { data: callControlRows } = await supabase
+        .from('calls')
+        .select(selectColumns)
+        .eq('call_control_id', callControlId)
+        .order('created_at', { ascending: false })
+        .limit(1);
+    if (callControlRows?.[0])
+        return { call: callControlRows[0], legType: 'agent', source: 'db_call_control' };
+    const { data: leadRows } = await supabase
+        .from('calls')
+        .select(selectColumns)
+        .eq('lead_leg_id', callControlId)
+        .order('created_at', { ascending: false })
+        .limit(1);
+    if (leadRows?.[0])
+        return { call: leadRows[0], legType: 'lead', source: 'db_lead_leg' };
+    return null;
+}
+async function classifyWebhookLeg(event, callControlId, callData, decodedClientState) {
+    const base = {
+        event,
+        call_control_id: callControlId,
+        call_leg_id: callData?.call_leg_id ?? null,
+        call_session_id: callData?.call_session_id ?? null,
+        direction: callData?.direction ?? null,
+        client_state: decodedClientState,
+    };
+    if (decodedClientState.leg_type === 'agent') {
+        console.log('[WEBHOOK_LEG_CLASSIFIED_AGENT]', { ...base, source: 'client_state' });
+        return decodedClientState;
+    }
+    if (decodedClientState.leg_type === 'lead') {
+        console.log('[WEBHOOK_LEG_CLASSIFIED_LEAD]', { ...base, source: 'client_state' });
+        return decodedClientState;
+    }
+    const mapped = await findCallByLegId(callControlId);
+    if (mapped?.legType === 'agent') {
+        console.log('[WEBHOOK_LEG_CLASSIFIED_AGENT]', {
+            ...base,
+            source: mapped.source,
+            call_id: mapped.call.id,
+            agent_id: mapped.call.agent_id,
+            lead_id: mapped.call.lead_id,
+            status: mapped.call.status,
+        });
+        return {
+            ...decodedClientState,
+            leg_type: 'agent',
+            call_id: decodedClientState.call_id ?? mapped.call.id,
+            agent_id: decodedClientState.agent_id ?? mapped.call.agent_id,
+            lead_id: decodedClientState.lead_id ?? mapped.call.lead_id,
+        };
+    }
+    if (mapped?.legType === 'lead') {
+        console.log('[WEBHOOK_LEG_CLASSIFIED_LEAD]', {
+            ...base,
+            source: mapped.source,
+            call_id: mapped.call.id,
+            agent_id: mapped.call.agent_id,
+            lead_id: mapped.call.lead_id,
+            status: mapped.call.status,
+        });
+        return {
+            ...decodedClientState,
+            leg_type: 'lead',
+            call_id: decodedClientState.call_id ?? mapped.call.id,
+            agent_id: decodedClientState.agent_id ?? mapped.call.agent_id,
+            lead_id: decodedClientState.lead_id ?? mapped.call.lead_id,
+        };
+    }
+    console.warn('[WEBHOOK_LEG_UNKNOWN]', base);
+    return decodedClientState;
+}
 function buildAgentDialTarget(sipUsername) {
     const fallbackDomain = process.env.AGENT_LEG_SIP_DOMAIN || 'aeondial.sip.telnyx.com';
     const normalizedUsername = sipUsername.trim().replace(/^sip:/, '').split('@')[0];
@@ -499,10 +584,11 @@ export async function telnyxWebhookRoutes(app) {
         if (!event || !callData)
             return reply.status(200).send({ ok: true });
         const callControlId = callData.call_control_id;
-        const clientState = decodeState(callData.client_state);
+        let clientState = decodeState(callData.client_state);
         console.log(`[webhook] ${event} | leg: ${callControlId} | type: ${clientState.leg_type ?? clientState.action ?? 'unknown'}`);
         // All webhook processing logic moved into setImmediate for instant ACK
         setImmediate(async () => {
+            clientState = await classifyWebhookLeg(event, callControlId, callData, clientState);
             switch (event) {
                 case 'call.initiated': {
                     const direction = callData.direction;
@@ -808,6 +894,14 @@ export async function telnyxWebhookRoutes(app) {
                             .from('calls')
                             .update({ lead_leg_id: callControlId, answered_at: call.answered_at ?? now })
                             .eq('id', call.id);
+                        console.log('[LEAD_LEG_MAPPED]', {
+                            call_id: call.id,
+                            lead_id: call.lead_id,
+                            agent_id: call.agent_id,
+                            group_id: call.group_id,
+                            lead_call_control_id: callControlId,
+                            previous_status: call.status,
+                        });
                         console.log('[LEAD_ANSWERED]', {
                             lead_id: call.lead_id,
                             call_id: call.id,
@@ -957,6 +1051,7 @@ export async function telnyxWebhookRoutes(app) {
                             await releaseAgentBatchLock(clientState.agent_id);
                             break;
                         }
+                        let agentFailedBeforeAnswer = false;
                         for (const call of calls ?? []) {
                             if (call.status === 'bridged') {
                                 if (call.lead_leg_id)
@@ -967,6 +1062,17 @@ export async function telnyxWebhookRoutes(app) {
                                     .eq('id', call.id);
                             }
                             else {
+                                if (!call.answered_at && !call.lead_leg_id) {
+                                    agentFailedBeforeAnswer = true;
+                                    console.warn('[AGENT_LEG_FAILED_BEFORE_ANSWER]', {
+                                        agent_id: clientState.agent_id,
+                                        call_id: call.id,
+                                        lead_id: call.lead_id,
+                                        group_id: call.group_id,
+                                        status: call.status,
+                                        agent_call_control_id: callControlId,
+                                    });
+                                }
                                 if (call.lead_leg_id) {
                                     // Agent dropped before bridge but lead leg exists (lead is ringing or answered).
                                     // Hang up the lead leg immediately — don't leave the lead on a dead line.
@@ -990,6 +1096,14 @@ export async function telnyxWebhookRoutes(app) {
                             .from('agent_sessions')
                             .update({ state: 'REGISTERED', active_call_id: null, updated_at: now })
                             .eq('agent_id', clientState.agent_id);
+                        if (agentFailedBeforeAnswer) {
+                            console.log('[BATCH_RELEASED_AGENT_NOT_ANSWERED]', {
+                                agent_id: clientState.agent_id,
+                                agent_call_control_id: callControlId,
+                                group_ids: groupIds,
+                                call_count: calls.length,
+                            });
+                        }
                         await releaseAgentBatchLock(clientState.agent_id);
                         break;
                     }

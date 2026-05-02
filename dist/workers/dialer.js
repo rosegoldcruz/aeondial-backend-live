@@ -519,6 +519,14 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
             status: 'agent_dialing',
         })
             .in('id', callIds);
+        console.log('[WAITING_FOR_AGENT_ANSWER]', {
+            agent_id: agentId,
+            group_id: groupId,
+            call_id: primaryCallId,
+            call_ids: callIds,
+            agent_call_control_id: agentCallControlId,
+            held_lead_count: leadIds.length,
+        });
         console.log(`[WORKER] Dialing agent ${agentDialTarget} | leads held: ${leadIds.join(',')} | batch size: ${batchSize} | group: ${groupId}`);
     }
     catch (err) {
@@ -527,6 +535,13 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
             agent_id: agentId,
             group_id: groupId,
             call_ids: callIds,
+            error: errorDetails,
+        });
+        console.error('[AGENT_LEG_FAILED_BEFORE_ANSWER]', {
+            agent_id: agentId,
+            group_id: groupId,
+            call_ids: callIds,
+            reason: 'agent_originate_failed',
             error: errorDetails,
         });
         console.error(`[WORKER] Agent dial failed: ${errorDetails.message}`);
@@ -573,6 +588,10 @@ async function failReservedLeads(agentId, leadIds) {
         .from('leads')
         .update({ status: 'failed', assigned_agent_id: null })
         .in('id', leadIds);
+    console.log('[BATCH_RELEASED_AGENT_NOT_ANSWERED]', {
+        agent_id: agentId,
+        lead_ids: leadIds,
+    });
     console.log(`[BATCH_FAILED_RELEASE_AGENT] agent_id=${agentId} lead_ids=${leadIds.join(',')}`);
     await redis.set(`dialer:agent:${agentId}:locked`, '1', 'PX', ORIGINATE_FAILURE_COOLDOWN_MS);
 }
