@@ -25,12 +25,12 @@ if (!process.env.JWT_SECRET) {
   throw new Error('FATAL: JWT_SECRET environment variable is not set');
 }
 
-const ALLOWED_ORIGINS = [
+const allowedOrigins = new Set([
   'https://ivsol.aeondial.com',
   'https://crm.aeondial.com',
   'http://localhost:3000',
-  'http://localhost:3001',
-];
+  'http://127.0.0.1:3000',
+]);
 
 app.addContentTypeParser('text/csv', { parseAs: 'string' }, (_req, body, done) => {
   done(null, body);
@@ -38,14 +38,13 @@ app.addContentTypeParser('text/csv', { parseAs: 'string' }, (_req, body, done) =
 
 // ── Plugins ──────────────────────────────────────────────
 await app.register(cors, {
-  origin: (origin, cb) => {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
-      cb(null, true);
-    } else {
-      cb(new Error(`CORS: origin ${origin} not allowed`), false);
-    }
-  },
   credentials: true,
+  origin: (origin, cb) => {
+    if (!origin || allowedOrigins.has(origin)) return cb(null, true);
+    return cb(new Error(`CORS origin not allowed: ${origin}`), false);
+  },
+  allowedHeaders: ['authorization', 'content-type', 'x-requested-with'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 });
 
 const helmetPlugin = await import('@fastify/helmet');
@@ -123,7 +122,16 @@ const PORT = Number(process.env.PORT ?? 3001);
 try {
   await app.listen({ port: PORT, host: '0.0.0.0' });
   console.log(`[AEON DIAL] API running on port ${PORT}`);
-} catch (err) {
+} catch (err: any) {
   app.log.error(err);
-  process.exit(1);
+
+  // Prevent PM2 from hammer-restarting into an EADDRINUSE loop.
+  // If another healthy API process already owns the port, keep this process alive
+  // briefly instead of exiting immediately and creating a restart storm.
+  if (err?.code === 'EADDRINUSE') {
+    console.error(`[AEON DIAL] Port ${PORT} already in use; suppressing restart storm.`);
+    setInterval(() => {}, 60_000);
+  } else {
+    process.exit(1);
+  }
 }

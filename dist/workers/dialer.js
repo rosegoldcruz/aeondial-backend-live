@@ -134,11 +134,20 @@ const TEST_PHONE_NUMBERS = (process.env.TEST_PHONE_NUMBERS ?? '')
     .split(',')
     .map((phone) => phone.trim())
     .filter(Boolean);
+const smokeTestMode = process.env.AEON_SMOKE_TEST_MODE === 'true';
+const smokeTestPhones = new Set((process.env.AEON_SMOKE_TEST_PHONES || '').split(',').map(p => p.trim()).filter(Boolean));
 const POST_RELEASE_COOLDOWN_MS = 2000; // delay before agent becomes eligible again
 const ORIGINATE_FAILURE_COOLDOWN_MS = 30000;
 const SOLO_AGENT_BATCH_SIZE = 3;
 const MULTI_AGENT_BATCH_SIZE = 3;
 let abandonmentMonitorTick = 0;
+// ── SMOKE TEST HARD SAFETY GATE (FAIL CLOSED) ─────────────────────
+if (smokeTestMode) {
+    console.log(`[SMOKE_TEST_MODE] enabled phones=${Array.from(smokeTestPhones).join(',') || 'NONE'}`);
+    if (smokeTestPhones.size === 0) {
+        throw new Error('SMOKE_TEST_MODE enabled but AEON_SMOKE_TEST_PHONES is empty — FAIL CLOSED');
+    }
+}
 function getErrorDetails(err) {
     return {
         message: err?.message ?? String(err),
@@ -398,11 +407,20 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
     }
     else {
         // Production path: Fetch candidates with SKIP LOCKED.
-        const { data: allCandidates, error: fetchError } = await supabase.rpc('fetch_leads_skip_locked', {
-            p_campaign_id: campaign.id,
-            p_max_attempts: maxAttempts,
-            p_batch_size: 25,
-        });
+        // SmokeTestMode=true → call fetch_smoke_test_leads_skip_locked with p_phone_whitelist (RPC-level filter)
+        // else → original production RPC. Production behavior unchanged when smokeTestMode=false.
+        const { data: allCandidates, error: fetchError } = smokeTestMode
+            ? await supabase.rpc('fetch_smoke_test_leads_skip_locked', {
+                p_campaign_id: campaign.id,
+                p_max_attempts: maxAttempts,
+                p_batch_size: 25,
+                p_phone_whitelist: Array.from(smokeTestPhones),
+            })
+            : await supabase.rpc('fetch_leads_skip_locked', {
+                p_campaign_id: campaign.id,
+                p_max_attempts: maxAttempts,
+                p_batch_size: 25,
+            });
         if (fetchError) {
             console.error(`[WORKER] Lead fetch error: ${fetchError.message}`);
             await supabase
@@ -419,6 +437,21 @@ const dialWorker = new Worker(DIAL_QUEUE, async (job) => {
             return true;
         })
             .slice(0, batchSize);
+    }
+    // Hard pre-Telnyx dial guard (defense-in-depth): block any non-whitelist lead in smoke mode
+    // (RPC filter in smoke path ensures this rarely triggers; non-whitelist leads never reach Telnyx)
+    if (smokeTestMode) {
+        const beforeGuard = leads.length;
+        leads = leads.filter((lead) => {
+            if (!smokeTestPhones.has(lead.phone)) {
+                console.log(`[SMOKE_TEST_BLOCKED_NON_WHITELIST_LEAD] ${lead.phone}`);
+                return false;
+            }
+            return true;
+        });
+        if (leads.length < beforeGuard) {
+            console.log(`[SMOKE_TEST_GUARD_FILTERED] blocked=${beforeGuard - leads.length} remaining=${leads.length}`);
+        }
     }
     if (leads.length === 0) {
         if (filterPhones) {
