@@ -253,6 +253,14 @@ export async function callRoutes(app) {
         if (call.agent_leg_id)
             hangups.push(hangupCall(call.agent_leg_id).catch(() => null));
         await Promise.all(hangups);
+        await supabase
+            .from('agent_sessions')
+            .update({
+            active_call_id: null,
+            updated_at: new Date().toISOString(),
+        })
+            .eq('agent_id', agentId)
+            .eq('active_call_id', callId);
         return reply.send({ success: true });
     });
     // POST /calls/:id/voicemail-drop — agent manually drops voicemail audio to lead leg
@@ -269,7 +277,7 @@ export async function callRoutes(app) {
             return reply.status(404).send({ error: 'Call not found' });
         }
         await telnyxAction(call.lead_leg_id, 'playback_start', {
-            audio_url: 'https://api.aeondial.com/static/VoicemailDrop.mp3',
+            audio_url: 'https://api.aeondial.com/audio/VoicemailDrop.mp3',
             loop: 'once',
             client_state: encodeState({ call_id: id, action: 'manual_voicemail' }),
         });

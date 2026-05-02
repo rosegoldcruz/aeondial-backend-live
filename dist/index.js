@@ -15,6 +15,7 @@ import { leadRoutes } from './routes/leads.js';
 import { listRoutes } from './routes/lists.js';
 import { campaignStatsRoute } from './routes/campaignStats.js';
 import { telnyxWebhookRoutes } from './routes/webhooks.js';
+import { adminRoutes } from './routes/admin.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = Fastify({ logger: true, bodyLimit: 52428800 });
 if (!process.env.JWT_SECRET) {
@@ -83,6 +84,7 @@ await app.register(campaignStatsRoute, { prefix: '/campaigns' });
 await app.register(agentRoutes, { prefix: '/agents' });
 await app.register(leadRoutes, { prefix: '/leads' });
 await app.register(listRoutes, { prefix: '/lists' });
+await app.register(adminRoutes, { prefix: '/admin' });
 await app.register(telnyxWebhookRoutes);
 const ALLOWED_AUDIO_FILES = new Set(['HoldMusic.mp3', 'LiveAnswerIVR.mp3', 'VoicemailDrop.mp3']);
 app.get('/audio/:file', async (req, reply) => {

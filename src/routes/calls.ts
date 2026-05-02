@@ -281,6 +281,15 @@ export async function callRoutes(app: FastifyInstance) {
     if (call.agent_leg_id) hangups.push(hangupCall(call.agent_leg_id).catch(() => null));
     await Promise.all(hangups);
 
+    await supabase
+      .from('agent_sessions')
+      .update({
+        active_call_id: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('agent_id', agentId)
+      .eq('active_call_id', callId);
+
     return reply.send({ success: true });
   });
 
