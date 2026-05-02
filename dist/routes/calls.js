@@ -44,34 +44,97 @@ const wrapUpSchema = z.object({
     notes: z.string().optional(),
     callback_at: z.string().datetime().optional(),
 });
+const ACTIVE_CALL_STATUSES = [
+    'created',
+    'agent_dialing',
+    'agent_answered',
+    'lead_dialing',
+    'lead_answered',
+    'dialing',
+    'agent_reserved',
+    'bridged',
+];
 export async function callRoutes(app) {
     // GET /calls/current — get agent's active call with lead info
     app.get('/current', { onRequest: [app.authenticate] }, async (req, reply) => {
         const { agentId } = req.user;
-        const { data: call } = await supabase
+        console.log('[CALLS_CURRENT_REQUEST]', { agent_id: agentId });
+        const { data: call, error } = await supabase
             .from('calls')
             .select(`
-        *,
+        id,
+        status,
+        group_id,
+        agent_leg_id,
+        lead_leg_id,
+        started_at,
+        answered_at,
+        bridged_at,
+        notes,
         leads (
-          id, first_name, last_name, phone, email,
-          city, state, quality
+          id,
+          first_name,
+          last_name,
+          phone,
+          email,
+          address,
+          city,
+          state,
+          zip,
+          consent_source,
+          notes
+        ),
+        campaigns (
+          name
         )
       `)
             .eq('agent_id', agentId)
-            .in('status', [
-            'created',
-            'agent_dialing',
-            'agent_answered',
-            'lead_dialing',
-            'lead_answered',
-            'dialing',
-            'agent_reserved',
-            'bridged',
-        ])
+            .in('status', ACTIVE_CALL_STATUSES)
             .order('created_at', { ascending: false })
             .limit(1)
-            .single();
-        return reply.send({ call: call ?? null });
+            .maybeSingle();
+        if (error) {
+            console.error('[CALLS_CURRENT_NONE]', { agent_id: agentId, error: error.message });
+            return reply.status(500).send({ error: error.message });
+        }
+        if (!call) {
+            console.log('[CALLS_CURRENT_NONE]', { agent_id: agentId });
+            return reply.send({ call: null });
+        }
+        const lead = Array.isArray(call.leads) ? call.leads[0] : call.leads;
+        const campaign = Array.isArray(call.campaigns) ? call.campaigns[0] : call.campaigns;
+        const currentCall = {
+            id: call.id,
+            status: call.status,
+            group_id: call.group_id,
+            agent_leg_id: call.agent_leg_id,
+            lead_leg_id: call.lead_leg_id,
+            started_at: call.started_at,
+            answered_at: call.answered_at,
+            bridged_at: call.bridged_at,
+            lead: lead ? {
+                id: lead.id,
+                first_name: lead.first_name,
+                last_name: lead.last_name,
+                phone: lead.phone,
+                email: lead.email,
+                address: lead.address,
+                city: lead.city,
+                state: lead.state,
+                zipcode: lead.zip,
+                source: lead.consent_source,
+                campaign: campaign?.name ?? null,
+                notes: lead.notes ?? call.notes ?? null,
+                metadata: null,
+            } : null,
+        };
+        console.log('[CALLS_CURRENT_ACTIVE_FOUND]', {
+            agent_id: agentId,
+            call_id: currentCall.id,
+            call_status: currentCall.status,
+            lead_id: currentCall.lead?.id ?? null,
+        });
+        return reply.send({ call: currentCall });
     });
     // POST /calls/:id/wrapup — submit disposition and notes
     app.post('/:id/wrapup', { onRequest: [app.authenticate] }, async (req, reply) => {
