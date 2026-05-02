@@ -164,28 +164,59 @@ export async function callRoutes(app: FastifyInstance) {
 
     const { disposition, notes, callback_at } = body.data;
 
+    console.log('[DISPOSITION_UPDATE_REQUEST]', {
+      agent_id: agentId,
+      call_id: callId,
+      disposition,
+    });
+
     // Verify this call belongs to this agent
-    const { data: call } = await supabase
+    const { data: call, error: callError } = await supabase
       .from('calls')
       .select('id, lead_id, agent_id, status')
       .eq('id', callId)
       .eq('agent_id', agentId)
-      .single();
+      .maybeSingle();
+
+    if (callError) {
+      console.error('[DISPOSITION_UPDATE_ERROR]', {
+        agent_id: agentId,
+        call_id: callId,
+        error: callError.message,
+      });
+      return reply.status(500).send({ error: callError.message });
+    }
 
     if (!call) {
+      console.warn('[DISPOSITION_UPDATE_ERROR]', {
+        agent_id: agentId,
+        call_id: callId,
+        error: 'Call not found',
+      });
       return reply.status(404).send({ error: 'Call not found' });
     }
 
     // Update call
-    await supabase
+    const now = new Date().toISOString();
+    const { error: updateError } = await supabase
       .from('calls')
       .update({
         disposition,
         notes: notes ?? null,
         status: 'completed',
-        wrapped_at: new Date().toISOString(),
+        wrapped_at: now,
+        updated_at: now,
       })
       .eq('id', callId);
+
+    if (updateError) {
+      console.error('[DISPOSITION_UPDATE_ERROR]', {
+        agent_id: agentId,
+        call_id: callId,
+        error: updateError.message,
+      });
+      return reply.status(500).send({ error: updateError.message });
+    }
 
     const { count: wrapupCount } = await supabase
       .from('agent_sessions')
@@ -254,6 +285,13 @@ export async function callRoutes(app: FastifyInstance) {
       entity_id: callId,
       event_type: 'CALL_WRAPPED_UP',
       payload: { disposition, notes, callback_at, agent_id: agentId },
+    });
+
+    console.log('[DISPOSITION_UPDATE_SUCCESS]', {
+      agent_id: agentId,
+      call_id: callId,
+      disposition,
+      previous_status: call.status,
     });
 
     return reply.send({ success: true, state: 'READY' });
